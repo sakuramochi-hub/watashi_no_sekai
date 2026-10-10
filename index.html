@@ -11,9 +11,99 @@ canvas{display:block;width:100%;height:100%}
 #c:before,#c:after{content:"";position:absolute;background:#fff}
 #c:before{left:7px;top:0;width:2px;height:16px}
 #c:after{top:7px;left:0;height:2px;width:16px}
+
+#three-credit{
+	position:fixed;right:8px;bottom:8px;
+	color:rgba(255,255,255,.7);
+	font:11px sans-serif;
+	text-shadow:0 1px 2px rgba(0,0,0,.8);
+	z-index:3
+}
+#three-credit button{
+	padding:0;border:0;background:none;color:#fff;
+	font:inherit;text-decoration:underline;cursor:pointer
+}
+#license-modal{
+	display:none;position:fixed;inset:0;z-index:1000;
+	align-items:center;justify-content:center;
+	padding:20px;background:rgba(0,0,0,.7);
+	font:14px/1.6 sans-serif;color:#222;
+	text-shadow:none
+}
+#license-modal.open{display:flex}
+#license-panel{
+	position:relative;width:min(680px,100%);max-height:85vh;
+	overflow:auto;box-sizing:border-box;padding:24px;
+	border-radius:10px;background:#fff
+}
+#license-panel h2{margin:0 0 16px;font-size:20px}
+#license-text{
+	white-space:pre-wrap;overflow-wrap:anywhere;
+	font:12px/1.6 monospace
+}
+#license-close{
+	position:absolute;right:12px;top:10px;
+	border:0;background:none;font-size:24px;cursor:pointer
+}
 </style>
-</head>
-<body>
+
+<div id="three-credit">
+	Powered by <button id="show-license" type="button">Three.js</button>
+</div>
+
+<div id="license-modal" role="dialog" aria-modal="true"
+	aria-labelledby="license-title">
+	<div id="license-panel">
+		<button id="license-close" type="button"
+			aria-label="閉じる">×</button>
+		<h2 id="license-title">Three.js MIT License</h2>
+		<div id="license-text">The MIT License
+
+Copyright © 2010-2026 three.js authors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE.</div>
+	</div>
+</div>
+
+<script>
+const licenseModal = document.getElementById('license-modal');
+
+document.getElementById('show-license').addEventListener('click', () => {
+	licenseModal.classList.add('open');
+});
+
+document.getElementById('license-close').addEventListener('click', () => {
+	licenseModal.classList.remove('open');
+});
+
+licenseModal.addEventListener('click', event => {
+	if (event.target === licenseModal) {
+		licenseModal.classList.remove('open');
+	}
+});
+
+document.addEventListener('keydown', event => {
+	if (event.key === 'Escape') {
+		licenseModal.classList.remove('open');
+	}
+});
+</script>
 <div id="c"></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script>
