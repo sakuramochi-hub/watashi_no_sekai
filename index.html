@@ -1,0 +1,2860 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>わたしのセカイ</title>
+<style>
+html,body{margin:0;height:100%;background:#000;overflow:hidden}
+canvas{display:block;width:100%;height:100%}
+#c{position:fixed;left:50%;top:50%;width:16px;height:16px;margin:-8px 0 0 -8px;pointer-events:none;mix-blend-mode:difference}
+#c:before,#c:after{content:"";position:absolute;background:#fff}
+#c:before{left:7px;top:0;width:2px;height:16px}
+#c:after{top:7px;left:0;height:2px;width:16px}
+</style>
+</head>
+<body>
+<div id="c"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+// ================= データ定義 =================
+// ブロック追加は BLOCKS に1行足すだけ。tex は TEXTURES の名前。all か top/side/bottom で面ごとに指定できる。
+//   solid: 当たり判定あり / opaque: 隣接面を隠す(葉・ガラス等は false) / placeable: ホットバーに入れられる / blocksLight: 光を遮る(省略時は opaque と同じ)
+//   透明テクスチャの扱い: render 省略=切り抜き(アルファ0.5未満のピクセルは描かない。葉・植物向け) / render:'translucent'=半透明(アルファ通りに blend。水・ガラス向け)
+//   cull:'same' = 同じブロック同士が接する面を描かない(ガラス向け。省略時は opaque なブロックにだけ隠される=葉は内側の面も描いて奥行きが出る)
+const BLOCKS={
+  air:  {id:0,solid:false,opaque:false},
+  stone:{id:1,solid:true,opaque:true,placeable:true,tex:{all:'stone'}},
+  grass:{id:2,solid:true,opaque:true,placeable:true,tex:{top:'grass_top',side:'grass_side',bottom:'dirt'}},
+  dirt:{id:3,solid:true,opaque:true,placeable:true,tex:{all:'dirt'}},
+  bedrock:{id:4,solid:true,opaque:true,placeable:false,tex:{all:'bedrock'}},
+  log:{id:5,solid:true,opaque:true,placeable:true,tex:{top:'log_top',side:'log_side',bottom:'log_top'}},
+  birch_log:{id:6,solid:true,opaque:true,placeable:true,tex:{top:'birch_top',side:'birch_side',bottom:'birch_top'}},
+  leaves:{id:7,solid:true,opaque:false,blocksLight:true,placeable:true,tex:{all:'leaves'}},   // 隙間は透明(切り抜き)。重ければ cull:'same' を足すと葉同士の内側の面を省ける
+  brick:{id:8,solid:true,opaque:true,placeable:true,tex:{all:'brick'}},
+  stone_brick:{id:9,solid:true,opaque:true,placeable:true,tex:{all:'stone_brick'}},
+  oak_planks:{id:10,solid:true,opaque:true,placeable:true,tex:{all:'oak_planks'}},
+  bean_0:{id:11,solid:false,opaque:false,shape:'cross',fluidBreaks:true,tex:{all:'bean_0'},plant:{next:'bean_1',avg:30}},
+  bean_1:{id:12,solid:false,opaque:false,shape:'cross',fluidBreaks:true,tex:{all:'bean_1'},plant:{next:'bean_2',avg:30}},
+  bean_2:{id:13,solid:false,opaque:false,shape:'cross',fluidBreaks:true,tex:{all:'bean_2'},plant:{next:'bean_3',avg:30}},
+  bean_3:{id:14,solid:false,opaque:false,shape:'cross',fluidBreaks:true,tex:{all:'bean_3'},plant:{harvest:{to:'bean_1',give:'bean'}}},
+  // 流体: render:'translucent'=半透明メッシュ / fluid=泳ぎ・流れのデータ / targetable:false=レイが貫通 / replaceable=設置で置き換え可 / fluidBreaks=流れに壊される
+  water:{id:15,solid:false,opaque:false,render:'translucent',tex:{all:'water'},targetable:false,replaceable:true,blocksLight:true,
+    fluid:{kind:'water',surface:14/16,
+      physics:{gravity:3,fall:4,speed:.7,accel:.6,swimUp:4.5,climb:5.5,drag:2.5},
+      camera:{tint:'rgba(30,80,200,.35)',fog:{color:'#1f4fa8',near:.5,far:20}},
+      flow:{spread:7,tickMs:250,infiniteSource:true}}},
+  sand:{id:16,solid:true,opaque:true,placeable:true,tex:{all:'sand'}},
+  gravel:{id:17,solid:true,opaque:true,placeable:true,tex:{all:'gravel'}},
+  sandstone:{id:19,solid:true,opaque:true,placeable:true,tex:{top:'sandstone_top',side:'sandstone',bottom:'sandstone_top'}},
+  glass:{id:18,solid:true,opaque:false,render:'translucent',cull:'same',blocksLight:false,placeable:true,tex:{all:'glass'}}
+};
+// 流れレベルのブロック(water_1〜water_7)を fluid.flow.spread から自動生成。水源のレベルは spread+1
+{let nid=20;for(const [n,b] of Object.entries(BLOCKS))if(b.fluid&&b.fluid.flow)for(let l=1;l<=b.fluid.flow.spread;l++)BLOCKS[n+'_'+l]={...b,id:nid++,fluid:{...b.fluid,level:l}}}
+// アイテム(ブロックではないもの)。plants: 地面に使うと置かれるブロック / on: 置ける地面
+const ITEMS={bean:{id:1000,tex:'bean_item',plants:'bean_0',on:['grass','dirt']}};
+// ================= テクスチャ定義 =================
+// 16x16。「描画命令の配列」で書く(1テクスチャ=1行)。上から順に重ね描きされ、色は '#rrggbb'、noise は明度のばらつき(0〜1)。
+//   ['fill',色,noise]                  全面を塗る
+//   ['rect',x,y,w,h,色,noise]          矩形を塗る
+//   ['dots',色,個数]                   ランダムな点(シードはテクスチャ名で固定なので毎回同じ絵になる)
+//   ['pix',色,[[x,y],...]]             指定ピクセル
+//   ['rows',x,y,'行/行/...',{字:色}]   手描きパターン('/'で改行、パレットに無い文字は透明=何も描かない)
+//   --- 透明テクスチャ用 ---  色は '#rrggbbaa' と書くとアルファ付き(aa=00〜ff。上書きで塗る)。何も描いていないピクセルは最初から透明
+//   ['erase',x,y,w,h]                  矩形を透明に戻す(穴を開ける)
+//   ['erasepix',[[x,y],...]]           指定ピクセルを透明に戻す
+//   ['alpha',倍率]                     これまでに描いた全ピクセルの不透明度に倍率(0〜1)を掛ける(ガラス・水の半透明化)
+//   ['frame',色,太さ,noise]            タイルの外周に枠を描く(ガラスの縁など)
+//   ['leaves',基本色,濃い色,明るい色,穴の割合]   葉っぱ専用: 葉の模様を描き、隙間を透明にくり抜く(穴の割合は 0〜0.5 目安、省略時 .22。シードはテクスチャ名で固定)
+const TEXTURES={
+  missing:   [['rect',0,0,16,16,'#101010'],['rect',0,0,8,8,'#f000f0'],['rect',8,8,8,8,'#f000f0']],   // 未知ブロックの目印
+  stone:     [['fill','#7f7f7f',.08],['dots','#6a6a6a',11],['dots','#939393',07]],
+  cobble:    [['fill','#7f7f7f',.08],['crack',4,4,'#444444',3,24,1],['crack',8,4,'#444444',3,24,1],['crack',4,12,'#444444',3,24,1],['crack',8,12,'#444444',3,24,1]],
+  dirt:      [['fill','#866043',.1],['dots','#734c2f',20],['dots','#8c6842',12]],
+  grass_top: [['fill','#BBBBBB',.08],['dots','#B4B4B4',28],['dots','#C5C5C5',14]],
+  grass_side:[['fill','#866043',.1],['dots','#734c2f',14]],
+  grass_side_overlay:[['rect',0,0,16,3,'#BBBBBB',.08],['rows',0,3,'G.GG..G..GG.G.GG/..G....G....G...',{G:'#BBBBBB'}]],
+  log_side:  [['fill','#54463a',.08],['vdots','#45392e',5,2]],
+  log_top:   [['rect',0,0,16,16,'#54463a',.05],['rect',1,1,14,14,'#c2a270',.05],['rect',3,3,10,10,'#94774a',.05],['rect',4,4,8,8,'#c2a270',.05],['rect',6,6,4,4,'#94774a',.05],['rect',7,7,2,2,'#c2a270',.05]],
+  birch_side:  [['fill','#ebe8e4',.05],['vdots','#d1cec9',5,2]],
+  birch_top:   [['rect',0,0,16,16,'#ebe8e4',.05],['rect',1,1,14,14,'#ffe1b3',.05],['rect',3,3,10,10,'#e0c496',.05],['rect',4,4,8,8,'#ffe1b3',.05],['rect',6,6,4,4,'#e0c496',.05],['rect',7,7,2,2,'#ffe1b3',.05]],
+  leaves:    [['leaves','#A8A8A8','#919191','#B1B1B1',.22]],
+  tree_lod:  [['fill','#4b8b24',.05],['dots','#37691b',18],['dots','#62a83a',12]], // 遠景木LOD専用: 透明穴を持たない葉色
+  bedrock:   [['fill','#3c3c3c',.15],['dots','#1e1e1e',40],['dots','#5a5a5a',30]],
+  brick:   [['fill','#82421f',.05],['rect',0,3,16,1,'#bdada4',.05],['rect',0,7,16,1,'#bdada4',.05],['rect',0,11,16,1,'#bdada4',.05],['rect',0,15,16,1,'#bdada4',.05],['rect',0,0,1,3,'#bdada4',.05],['rect',8,0,1,3,'#bdada4',.05],['rect',0,8,1,3,'#bdada4',.05],['rect',8,8,1,3,'#bdada4',.05],['rect',3,4,1,3,'#bdada4',.05],['rect',11,4,1,3,'#bdada4',.05],['rect',3,12,1,3,'#bdada4',.05],['rect',11,12,1,3,'#bdada4',.05]],
+  stone_brick:   [['fill','#7f7f7f',.05],['rect',0,3,16,1,'#636363',.05],['rect',0,7,16,1,'#636363',.05],['rect',0,11,16,1,'#636363',.05],['rect',0,15,16,1,'#636363',.05],['rect',0,0,1,3,'#636363',.05],['rect',8,0,1,3,'#636363',.05],['rect',0,8,1,3,'#636363',.05],['rect',8,8,1,3,'#636363',.05],['rect',3,4,1,3,'#636363',.05],['rect',11,4,1,3,'#636363',.05],['rect',3,12,1,3,'#636363',.05],['rect',11,12,1,3,'#636363',.05]],
+  oak_planks:   [['fill','#c2a270',.05],['rect',0,3,16,1,'#8c7651',.05],['rect',0,7,16,1,'#8c7651',.05],['rect',0,11,16,1,'#8c7651',.05],['rect',0,15,16,1,'#8c7651',.05]],
+  water:     [['fill','#2f5fd0',.05],['dots','#4a7be8',20],['dots','#2450b0',14],['alpha',.72]],   // 半透明はテクスチャ側のアルファで表現(マテリアルは固定の透明度を持たない)
+  sand:      [['fill','#dbd3a0',.05],['dots','#cfc690',16],['dots','#e6dfb4',10]],
+  sandstone_top:[['fill','#dbd3a0',.04],['dots','#d2c994',10]],
+  sandstone: [['fill','#d6c98f',.05],['rect',0,0,16,1,'#e3d9a8'],['rect',0,5,16,1,'#c9bc82'],['rect',0,10,16,1,'#c9bc82'],['dots','#c4b77c',10]],
+  gravel:    [['fill','#857f7b',.12],['dots','#6b6663',24],['dots','#a09a96',16]],
+  glass:     [['fill','#cfe9f2',.03],['alpha',.18],['frame','#e8f6fb',1,.03],['pix','#ffffffd0',[[2,2],[3,3],[4,4],[2,4],[3,5]]]]
+};
+// ================= 豆・MOB のデータ =================
+// MOBS: parts は {size:[w,h,d](px,16px=1ブロック), at:[x,y,z](親の原点からの位置=回転軸), off:[x,y,z](箱を軸からずらす量), parent, color か tex:{面:テクスチャ名}}
+//   面は right/left/top/bottom/back/front(前=-Z)。指定なしの側面は side → all。'#rrggbb' はそのまま単色タイルになる。
+//   anim: 状態名 → {パーツ:{x|y|z:[基準角, 振れ幅, 速さ]}}('base' は常に適用)。variants は parts を上書き/追加できる。
+const kidFace=(hair,lash)=>[['fill','#ffe3cf',.02],['rect',0,0,16,5,hair,.04],['rect',0,5,2,3,hair],['rect',14,5,2,3,hair],['rect',3,8,3,4,'#2b1b17'],['rect',10,8,3,4,'#2b1b17'],['pix','#ffffff',[[3,8],[4,8],[10,8],[11,8]]],['rect',1,12,3,2,'#ffb3a7'],['rect',12,12,3,2,'#ffb3a7'],['rect',7,13,2,1,'#b04a3d'],...(lash?[['pix','#2b1b17',[[2,8],[2,9],[13,8],[13,9]]]]:[])];
+Object.assign(TEXTURES,{
+  bean_0:[['rect',7,12,2,4,'#3f8f2e',.05],['rect',4,11,3,2,'#5cb83d',.05],['rect',9,10,3,2,'#5cb83d',.05]],
+  bean_1:[['rect',7,8,2,8,'#3f8f2e',.05],['rect',3,9,4,2,'#5cb83d',.05],['rect',9,6,4,2,'#5cb83d',.05],['rect',4,5,3,2,'#5cb83d',.05]],
+  bean_2:[['rect',7,3,2,13,'#3f8f2e',.05],['rect',2,10,5,3,'#4fa636',.05],['rect',9,7,5,3,'#4fa636',.05],['rect',3,4,4,3,'#4fa636',.05],['rect',9,12,4,2,'#4fa636',.05]],
+  bean_3:[['rect',7,3,2,13,'#3f8f2e',.05],['rect',2,10,5,3,'#4fa636',.05],['rect',9,7,5,3,'#4fa636',.05],['rect',3,4,4,3,'#4fa636',.05],['rect',9,12,4,2,'#4fa636',.05],['rect',4,13,2,2,'#e0b957',.05],['rect',10,10,2,3,'#e0b957',.05],['rect',5,8,2,2,'#e0b957',.05]],
+  bean_item:[['rect',4,6,8,5,'#b5651d'],['rect',5,5,6,7,'#b5651d'],['rect',6,6,3,2,'#e0a060']],
+  kid_face_boy:kidFace('#7b4b2a',false),kid_face_girl:kidFace('#b5452e',true)
+});
+const MOBS={
+  pigeon:{r:.25,h:.45,parts:{
+    body:{size:[5,5,8],at:[0,5.5,0],color:'#8d93a0'},
+    legL:{parent:'body',size:[1,3,1],at:[-1.2,-2.5,0],off:[0,-1.5,0],color:'#d9644a'},
+    legR:{parent:'body',size:[1,3,1],at:[1.2,-2.5,0],off:[0,-1.5,0],color:'#d9644a'},
+    neck:{parent:'body',size:[3.6,2.2,2.8],at:[0,1.5,-3.5],color:'#4f8a73'},
+    head:{parent:'body',size:[3,3,3],at:[0,2.5,-3.5],off:[0,1,0],color:'#74688c'},
+    beak:{parent:'head',size:[1,1,2],at:[0,1,-2],color:'#3a3a3a'},
+    eyeL:{parent:'head',size:[.5,.8,.8],at:[-1.5,1.5,-1],color:'#f08a20'},
+    eyeR:{parent:'head',size:[.5,.8,.8],at:[1.5,1.5,-1],color:'#f08a20'},
+    tail:{parent:'body',size:[3,1,4],at:[0,.5,4.5],color:'#5d6270'},
+    wingL:{parent:'body',size:[4,.6,6],at:[-2.6,2,0],off:[-2,0,0],color:'#6e7482'},
+    wingR:{parent:'body',size:[4,.6,6],at:[2.6,2,0],off:[2,0,0],color:'#6e7482'}},
+   anim:{base:{wingL:{z:[1.35]},wingR:{z:[-1.35]}},
+    walk:{legL:{x:[0,.8,10]},legR:{x:[0,-.8,10]},head:{x:[0,.15,10]}},
+    peck:{head:{x:[-.5,.5,10]}},
+    fly:{wingL:{z:[.1,.8,26]},wingR:{z:[-.1,-.8,26]},legL:{x:[.9]},legR:{x:[.9]}}}},
+  villager:{r:.25,h:1.55,parts:{
+    legL:{size:[2.2,6.5,2.2],at:[-1.5,6.5,0],off:[0,-3.25,0],color:'#ffe3cf'},
+    legR:{size:[2.2,6.5,2.2],at:[1.5,6.5,0],off:[0,-3.25,0],color:'#ffe3cf'},
+    body:{size:[5.5,6,3.2],at:[0,9.5,0],color:'#ffffff'},
+    armL:{parent:'body',size:[1.6,6,1.8],at:[-3.55,2.2,0],off:[0,-2.5,0],color:'#ffe3cf'},
+    armR:{parent:'body',size:[1.6,6,1.8],at:[3.55,2.2,0],off:[0,-2.5,0],color:'#ffe3cf'},
+    head:{parent:'body',size:[8,7.5,8],at:[0,3,0],off:[0,3.75,0],color:'#7b4b2a'}},
+   anim:{walk:{legL:{x:[0,.7,9]},legR:{x:[0,-.7,9]},armL:{x:[0,-.6,9]},armR:{x:[0,.6,9]}},
+    hang:{armL:{z:[-2.6,-.15,6]},armR:{z:[2.6,.15,6]},legL:{x:[0,.3,5]},legR:{x:[0,-.3,5]}}},
+   variants:{
+    boy:{lines:['ハトさんに連れてきてもらったよ!','ぼく、空を飛んできたんだ!'],parts:{
+      body:{color:'#4fa05a'},head:{tex:{front:'kid_face_boy',all:'#7b4b2a'}},
+      shorts:{parent:'body',size:[5.8,2.2,3.4],at:[0,-3.9,0],color:'#8a5a3a'},
+      ahoge:{parent:'head',size:[1,3,1],at:[0,7.2,0],off:[0,1.5,0],color:'#7b4b2a'}}},
+    girl:{lines:['わたし空を飛んできたのよ!','ハトさん、ありがとう!'],parts:{
+      body:{color:'#f6d44a'},head:{tex:{front:'kid_face_girl',all:'#b5452e'}},
+      skirt:{parent:'body',size:[7.2,3.2,4.2],at:[0,-3.8,0],color:'#f6d44a'},
+      twinL:{parent:'head',size:[2.2,5.5,2.2],at:[-4.5,5.5,0],off:[0,-2.75,0],color:'#b5452e'},
+      twinR:{parent:'head',size:[2.2,5.5,2.2],at:[4.5,5.5,0],off:[0,-2.75,0],color:'#b5452e'},
+      ribL:{parent:'head',size:[1.6,1.6,3],at:[-4.2,6.2,0],color:'#e63946'},
+      ribR:{parent:'head',size:[1.6,1.6,3],at:[4.2,6.2,0],color:'#e63946'}}}}}
+};
+// 挙動データ: goals は優先度順で [ゴール名,パラメータ]、最初に true を返したものがそのtickを担当(GOALS 参照)
+//   interact: マウスボタン → {holding,wild,states,consume,set,hop,say,toast} / spawn: 自然湧き / persist: 保存する / home: 出現地点を拠点にする
+// errand: 'eat' 後に飛び去り、delay 秒後に cargo を吊るして戻ってくる(dist: 戻ってくる距離 / hang: 吊るす長さ)
+Object.assign(MOBS.pigeon,{errand:{delay:[40,90],dist:56,hang:1.35,cargo:{type:'villager',variants:['boy','girl']},toast:'遠くから羽音が聞こえる…'},air:true,idle:'peck',persist:false,
+  goals:[['bring'],['leave'],['eat'],['approach',{item:'bean',within:6,speed:1.5}],['wander',{speed:.9}]],
+  spawn:{on:['grass'],group:[2,4],cap:8,ring:[16,36],despawn:64},
+  interact:{2:{holding:'bean',states:['idle','walk'],consume:true,set:{st:'eat',t:1.2,wild:false},toast:'鳩が豆をついばんでいる…'},0:{hop:4}}});
+Object.assign(MOBS.villager,{persist:true,home:true,headTurn:true,
+  goals:[['carried'],['lookAt',{within:6}],['wander',{speed:1}]],
+  interact:{2:{say:true},0:{hop:5,toast:'わっ!'},1:{hop:5,toast:'わっ!'}}});
+for(const c of new Set(JSON.stringify(MOBS).match(/#[0-9a-f]{6}/gi)||[]))TEXTURES[c]=[['fill',c,.04]];   // 単色パーツ用タイル
+const CONFIG={
+  world:{chunks:16,height:256,infinite:true},                       // infinite: true で560兆(2^49)ブロックの超巨大ワールド対応
+  terrain:{base:63,amplitude:34,scale:80,octaves:4,min:2,max:250,
+    blendRadius:32,                                                 // テレイン・ブレンディングの遷移幅(ブロック)
+    layers:[{block:'grass',depth:1},{block:'dirt',depth:3},{block:'stone'}]},  // 地表から下へ
+  // 描画負荷(内蔵GPU向け)。pixelRatio: 描画解像度の上限(1=画面ピクセル等倍) / adaptive: 重いと自動で解像度を下げる(下限 minPixelRatio)
+  render:{pixelRatio:1,minPixelRatio:.5,adaptive:true,maxFps:60,antialias:false},
+  hotbarSize:9,
+  hotbar:['stone','grass','dirt','log','leaves','bean'],                           // 初期のホットバー内容(実行中は E キーで変更)
+  startSlot:1,
+  seed:null,   // null = 起動ごとにランダム。固定すれば同じワールドを再現できる
+  // 読み込み範囲(チャンク単位)。renderDistance*16 がフォグ終端(48)より外なら見た目は変わらない
+  streaming:{renderDistance:4,keepMargin:2,cacheLimit:512,
+    lodDist:16,lodFarDist:40,treeLodMidDist:24, // 地形LODは従来どおり。木は16〜24=段形状、24〜40=粗い段形状、40+=葉の箱+幹。
+    useWorker:true,      // false でワーカーを使わずメインスレッドで生成(デバッグ用)
+    inboxMax:24,         // ワーカーから届いて未反映の結果がこれ以上溜まったら、新しい要求を止める(反映が追いつくまで待つ)
+    maxInFlight:6,       // ワーカーへ同時に投げるチャンク要求の数(多いほど速く埋まるが、遠いチャンクの無駄が増える)
+    meshBudgetMs:4,meshPerFrame:3},     // 1フレームでワーカーの結果を反映する時間の上限(ms)。生成・メッシュ化そのものはワーカー側
+  // Classic(rd-132211)のライティング: 柱ごとの高さマップで明/暗の2段階 × 面の向きによる固定シェード
+  lighting:{lit:1.0,dark:.7,faces:{top:1.0,bottom:.5,x:.6,z:.8}},
+  player:{speed:6,sprint:1.5,acceleration:32,airAcceleration:14,friction:24,gravity:22,jumpPower:8,
+    eyeHeight:1.7,height:1.8,radius:.35,mouseSensitivity:.0022,reach:6}
+};
+// ================= ストラクチャー定義 =================
+// 構造物は全てここに書くだけ(コードは触らない)。
+//   palette : 文字 → ブロック名。パレットに無い文字('.'など)は「何も置かない」
+//   layers  : 下から上へのY層。各層は行(Z方向)の文字列配列で、文字の位置がX
+//   origin  : [x,y,z] パターン内の基準セル。生成時、地表の1つ上のセルに重ねる
+//   overwrite: true なら既存ブロックも上書き(省略時は空気のセルだけに置く)
+//   spawn   : ワールド生成時の自動配置ルール(省略すれば手動配置専用)
+//     on(地表ブロック名) / chance(列ごとの確率) / spacing(他の構造物との最小間隔)
+//     maxSlope(足元の高低差の上限) / rotate(90度単位でランダム回転)
+//   entities: 構造物が初めて読み込まれたとき(原点のあるチャンク)に1回だけ出すMOB [{type,count:[最小,最大]}]。出現済みは保存される
+const STRUCTURES={
+  oak: {
+    palette: {"#":"log","o":"leaves"},
+    origin: [2, 0, 2],
+    layers: [
+      [
+        '.....',
+        '.....',
+        '..#..',
+        '.....',
+        '.....'
+      ],
+      [
+        '.....',
+        '.....',
+        '..#..',
+        '.....',
+        '.....'
+      ],
+      [
+        '.....',
+        '.....',
+        '..#..',
+        '.....',
+        '.....'
+      ],
+      [
+        '.....',
+        '..oo.',
+        '.o#o.',
+        '.oo..',
+        '.....'
+      ],
+      [
+        '.oo..',
+        'ooo..',
+        'oo#oo',
+        '..ooo',
+        '..oo.'
+      ],
+      [
+        '..oo.',
+        '..ooo',
+        'oo#oo',
+        'ooo..',
+        '.oo..'
+      ],
+      [
+        '.....',
+        '.oo..',
+        '.o#o.',
+        '..oo.',
+        '.....'
+      ],
+      [
+        '.....',
+        '.....',
+        '..o..',
+        '.....',
+        '.....'
+      ]
+    ],
+    spawn: {
+      on: ["grass"], chance: 0, spacing: 5, maxSlope: 2, rotate: true
+    }
+  },
+  smallTree:{
+    palette:{'#':'log','o':'leaves'},
+    origin:[1,0,1],
+    layers:[
+      ['ooo','o#o','ooo'],
+      ['.o.','ooo','.o.']
+    ],
+    spawn:{on:['grass'],chance:0,spacing:4,maxSlope:1,rotate:true}
+  },
+  beanPatch:{
+    palette:{'a':'bean_3'},
+    origin:[0,0,0],
+    layers:[['a']],
+    entities:[{type:'pigeon',count:[1,2]}],   // 構造物の生成時に1回だけ出現するMOB(型 / 数の範囲。variant は MOBS の variants からランダム)
+    spawn:{on:['grass'],chance:0,spacing:6,maxSlope:1,rotate:true}
+  },
+  birch:{
+    palette: {"#":"birch_log","o":"leaves"},
+    origin: [2, 0, 2],
+    layers: [
+      [
+        '.....',
+        '.....',
+        '..#..',
+        '.....',
+        '.....'
+      ],
+      [
+        '.....',
+        '.....',
+        '..#..',
+        '.....',
+        '.....'
+      ],
+      [
+        '.....',
+        '.....',
+        '..#..',
+        '.....',
+        '.....'
+      ],
+      [
+        '.....',
+        '.....',
+        '..#..',
+        '.....',
+        '.....'
+      ],
+      [
+        '.....',
+        '..oo.',
+        '.o#o.',
+        '.oo..',
+        '.....'
+      ],
+      [
+        '.oo..',
+        'ooo..',
+        'oo#oo',
+        '..ooo',
+        '..oo.'
+      ],
+      [
+        '..oo.',
+        '..ooo',
+        'oo#oo',
+        'ooo..',
+        '.oo..'
+      ],
+      [
+        '.....',
+        '.oo..',
+        '.o#o.',
+        '..oo.',
+        '.....'
+      ],
+      [
+        '.....',
+        '.....',
+        '..o..',
+        '.....',
+        '.....'
+      ]
+    ],
+    spawn: {
+      on: ["grass"], chance: 0, spacing: 5, maxSlope: 2, rotate: true
+    }
+  }
+};
+// ================= ワールド生成・バイオーム定義 =================
+// 関数を含まない純データ(Worker へそのまま渡す)。気候ノイズは整数scaleの格子 → 巨大座標でも正確。
+//  climate: c=大陸度(-1深海〜+1内陸) t=気温 h=湿度 ridge=川(|ridge|が小さい線が川)。gain で -1〜1 に正規化
+//  baseCurve/ampCurve: 大陸度 → 基準高さ / 起伏の倍率(折れ線)。海面より低ければ水で満たされる
+//  river: width=川床の幅 bankWidth=土手の幅(ノイズ単位) depth=川床の深さ bankHeight=土手の高さ(海面基準) cRange=川が現れる大陸度
+const WORLDGEN={
+  seaLevel:62, oceanThreshold:-.25,
+  climate:{c:{scale:512,octaves:3,salt:201,gain:1.5},t:{scale:768,octaves:2,salt:202,gain:1.5},
+           h:{scale:640,octaves:2,salt:203,gain:1.5},ridge:{scale:384,octaves:3,salt:204,gain:1.5}},
+  baseCurve:[[-1,22],[-.6,30],[-.25,56],[-.1,64],[.1,68],[.3,72],[1,86]],
+  ampCurve:[[-1,.15],[-.25,.3],[0,.7],[.3,1],[1,1.3]],
+  river:{width:.05,bankWidth:.07,depth:10,bankHeight:0,cRange:[-.2,.55]}
+};
+// BIOMES: domain('ocean'|'land'|'river') / climate(理想点。ドメイン内で最も近いものが選ばれる) / terrain{offset,amp}(境界でブレンド)
+//   river: その陸バイオームで川になるときの川バイオーム名 / structures: 構造物名→生成確率(無ければ STRUCTURES.spawn.chance)
+//   surface: 上から順に評価し最初に合う規則を使う。when: aboveSea[min,max](地表Y-海面) / y[min,max] / patch{scale,min}(ノイズの斑)
+const LAND_SURFACE=[{when:{aboveSea:[-99,-1]},layers:[{block:'sand',depth:3},{block:'stone'}]},   // 水中と浜辺
+  {layers:[{block:'grass',depth:1},{block:'dirt',depth:3},{block:'stone'}]}];
+// 地層(surface): 地表から下へ向かう層のリスト。バイオームごとに surface:[...] で自由に指定できる(省略不可)。
+//   layers: [{block:ブロック名, depth:厚さ(省略=無限)}, ...] / when を付けると条件付き(上から順に最初に合うものを採用)
+const DESERT_SURFACE=[{layers:[{block:'sand',depth:4},{block:'sandstone',depth:8},{block:'stone'}]}];   // 砂4 → 砂岩8 → 石
+const BIOMES={
+  plains:{label:'平原',domain:'land',climate:{c:.35,t:0,h:-.2},terrain:{offset:3,amp:.4},river:'river',surface:LAND_SURFACE,
+    foliageTint:'#91BD59', // 明るい黄緑
+    structures:{oak:0,birch:0,smallTree:0,beanPatch:.0012}},
+  desert:{label:'砂漠',domain:'land',climate:{c:.35,t:.5,h:0},terrain:{offset:3,amp:.6},river:'river',surface:DESERT_SURFACE,
+    foliageTint:'#BFB755',
+    structures:{oak:0,birch:0,smallTree:0,beanPatch:0}},
+  forest:{label:'森',domain:'land',climate:{c:.4,t:.1,h:.6},terrain:{offset:4,amp:.8},river:'river',surface:LAND_SURFACE,
+    foliageTint:'#79C05A', // 深い緑
+    structures:{oak:.024,birch:.024,smallTree:.004,beanPatch:.0006}},
+  ocean:{label:'海',domain:'ocean',climate:{c:-.4,t:0,h:0},foliageTint:'#88dd44',surface:[
+    {when:{aboveSea:[-99,-1],patch:{scale:24,min:.3}},layers:[{block:'gravel',depth:3},{block:'stone'}]},
+    {layers:[{block:'sand',depth:3},{block:'stone'}]}]},
+  deep_ocean:{label:'深海',domain:'ocean',climate:{c:-.7,t:0,h:0},waterTint:'#9fb4ff',foliageTint:'#66cc44',surface:[{layers:[{block:'gravel',depth:3},{block:'stone'}]}]},
+  river:{label:'川',domain:'river',waterTint:'#8cc8ff',foliageTint:'#77ee55',surface:[{layers:[{block:'sand',depth:2},{block:'gravel',depth:2},{block:'stone'}]}]}
+};
+const CN=CONFIG.world.chunks, W=CN*16, H=CONFIG.world.height;
+
+// データから高速参照用テーブルを生成
+const ID={},CROSS=new Uint8Array(256),SOLID=new Uint8Array(256),OPAQUE=new Uint8Array(256),CULL=new Uint8Array(256),LIGHTBLOCK=new Uint8Array(256),FACE_TEX=[];
+const TRANS=new Uint8Array(256),REPL=new Uint8Array(256),TARG=new Uint8Array(256),FB=new Uint8Array(256),FK=new Uint8Array(256),LV=new Uint8Array(256),FLUIDH=new Float32Array(256);
+const FKN=[null],FIDS={},FPHYS=[],FCAM=[],BLK=[];   // FK: 流体の種類番号 / LV: 流れレベル(水源=最大) / FIDS: 種類→[レベル→ID]
+for(const [name,b] of Object.entries(BLOCKS)){
+  BLK[b.id]=b;TRANS[b.id]=b.render==='translucent'?1:0;REPL[b.id]=(b.id===0||b.replaceable)?1:0;TARG[b.id]=b.id&&b.targetable!==false?1:0;FB[b.id]=b.fluidBreaks?1:0;
+  if(b.fluid){const f=b.fluid;let k=FKN.indexOf(f.kind);if(k<0)k=FKN.push(f.kind)-1;FK[b.id]=k;LV[b.id]=f.level||f.flow.spread+1;(FIDS[f.kind]=FIDS[f.kind]||[])[LV[b.id]]=b.id;
+    FLUIDH[b.id]=f.surface*LV[b.id]/(f.flow.spread+1);FPHYS[b.id]=f.physics;FCAM[b.id]=f.camera}
+  ID[name]=b.id;CROSS[b.id]=b.shape==='cross'?1:0;SOLID[b.id]=b.solid?1:0;OPAQUE[b.id]=b.opaque?1:0;CULL[b.id]=b.cull==='same'?1:0;LIGHTBLOCK[b.id]=(b.blocksLight??b.opaque)?1:0;
+  if(b.tex)FACE_TEX[b.id]={top:b.tex.top||b.tex.all,bottom:b.tex.bottom||b.tex.all,side:b.tex.side||b.tex.all};
+}
+for(const [n,i] of Object.entries(ITEMS))ID[n]=i.id;   // アイテムはブロックIDと別空間(1000〜)
+const ITEM_BY_ID={};for(const i of Object.values(ITEMS))ITEM_BY_ID[i.id]=i;
+const PLANT=[];for(const b of Object.values(BLOCKS))if(b.plant){const p=b.plant;PLANT[b.id]={next:p.next&&ID[p.next],avg:p.avg||30,to:p.harvest&&ID[p.harvest.to],give:p.harvest&&p.harvest.give}}   // 成長・収穫の表
+
+// ---------- テクスチャアトラス生成(起動時にコードで描く。外部画像は不要) ----------
+const TILE=16,ATLAS_COLS=16;
+const TEX_NAMES=Object.keys(TEXTURES),TEX_INDEX={};
+TEX_NAMES.forEach((n,i)=>TEX_INDEX[n]=i);
+const ATLAS_ROWS=Math.ceil(TEX_NAMES.length/ATLAS_COLS);
+const hexRGB=h=>[1,3,5].map(i=>parseInt(h.slice(i,i+2),16));
+const hexRGBA=h=>[...hexRGB(h),h.length>=9?parseInt(h.slice(7,9),16):255];   // '#rrggbb' → a=255 / '#rrggbbaa'
+function paintTexture(name,ops){
+  let seed=0;for(const ch of name)seed=Math.imul(seed^ch.charCodeAt(0),16777619);
+  const rnd=mulberry(seed),img=new ImageData(TILE,TILE);
+  const set=(x,y,col,nz=0)=>{
+    if(x<0||y<0||x>=TILE||y>=TILE)return;
+    const k=1+(rnd()*2-1)*nz,o=(y*TILE+x)*4,c=hexRGBA(col);
+    for(let i=0;i<3;i++)img.data[o+i]=Math.max(0,Math.min(255,c[i]*k));
+    img.data[o+3]=c[3];
+  };
+  const erase=(x,y)=>{if(x<0||y<0||x>=TILE||y>=TILE)return;const o=(y*TILE+x)*4;img.data[o]=img.data[o+1]=img.data[o+2]=img.data[o+3]=0};
+  for(const [op,...a] of ops){
+    if(op==='fill'){for(let y=0;y<TILE;y++)for(let x=0;x<TILE;x++)set(x,y,a[0],a[1])}
+    else if(op==='rect'){for(let y=a[1];y<a[1]+a[3];y++)for(let x=a[0];x<a[0]+a[2];x++)set(x,y,a[4],a[5])}
+    else if(op==='dots'){for(let i=0;i<a[1];i++)set(rnd()*TILE|0,rnd()*TILE|0,a[0])}
+    else if(op==='vdots'){for(let i=0;i<a[1];i++){let x=(i+.5)*TILE/a[1];for(let y=0;y<TILE;y++)set(Math.round(x+Math.sin(y*.7+i)*a[2]),y,a[0])}}
+    else if(op==='pix'){for(const [x,y] of a[1])set(x,y,a[0])}
+    else if(op==='rows'){a[2].split('/').forEach((r,j)=>[...r].forEach((ch,i)=>{if(a[3][ch])set(a[0]+i,a[1]+j,a[3][ch])}))}
+    else if(op==='erase'){for(let y=a[1];y<a[1]+a[3];y++)for(let x=a[0];x<a[0]+a[2];x++)erase(x,y)}
+    else if(op==='erasepix'){for(const [x,y] of a[0])erase(x,y)}
+    else if(op==='alpha'){for(let i=3;i<img.data.length;i+=4)img.data[i]=Math.round(img.data[i]*a[0])}
+    else if(op==='frame'){const w=a[1]||1;for(let y=0;y<TILE;y++)for(let x=0;x<TILE;x++)if(x<w||y<w||x>=TILE-w||y>=TILE-w)set(x,y,a[0],a[2])}
+    else if(op==='leaves'){   // 葉専用: 基本色の下地 → 濃淡の葉の塊 → 1〜2ピクセルの小さな穴を割合に達するまで開ける
+      const [base='#488622',dark='#2e5e10',light='#62a83a',holes=.22]=a;
+      for(let y=0;y<TILE;y++)for(let x=0;x<TILE;x++)set(x,y,base,.06);
+      const blob=(col,n)=>{for(let i=0;i<n;i++){const x=rnd()*TILE|0,y=rnd()*TILE|0,h=rnd()<.5;set(x,y,col,.05);set(x+(h?1:0),y+(h?0:1),col,.05)}};
+      blob(dark,TILE*TILE*.1|0);blob(light,TILE*TILE*.07|0);
+      const target=Math.round(TILE*TILE*Math.max(0,Math.min(.6,holes)));let cleared=0,guard=0;
+      while(cleared<target&&guard++<4000){
+        const x=rnd()*TILE|0,y=rnd()*TILE|0,h=rnd()<.5;
+        for(const [px,py] of [[x,y],[x+(h?1:0),y+(h?0:1)]])if(px<TILE&&py<TILE&&img.data[(py*TILE+px)*4+3]){erase(px,py);cleared++}
+      }
+    }
+    else if(op==='crack'){
+      const [cx,cy,col,count,len,width]=a;
+      const draw=(x,y,w)=>{
+        set(Math.round(x),Math.round(y),col);
+        if(w>1&&rnd()<.5){
+           set(Math.round(x+1),Math.round(y),col);
+        }
+      };
+      const walk=(x,y,angle,n,w,branch)=>{
+        for(let i=0;i<n;i++){
+          draw(x,y,Math.max(1,Math.round(w*(1-i/n*.7))));
+          angle+=(rnd()-.5)*.9;
+          x+=Math.cos(angle);
+          y+=Math.sin(angle);
+          if(x<0||y<0||x>=TILE||y>=TILE)break;
+          if(!branch&&rnd()<.08)walk(x,y,angle+(rnd()-.5)*1.8,Math.max(2,(n-i)*.35|0),w*.7,true);
+        }
+      };
+      draw(cx,cy,width+1);
+      for(let i=0;i<count;i++)walk(cx,cy,rnd()*Math.PI*2,len,width,false);
+    }
+    else throw new Error(`texture ${name}: unknown op "${op}"`);
+  }
+  return img;
+}
+const atlasCanvas=document.createElement('canvas');
+atlasCanvas.width=ATLAS_COLS*TILE;atlasCanvas.height=ATLAS_ROWS*TILE;
+const atlasCtx=atlasCanvas.getContext('2d'),TEX_URL={},TILE_IMG=[];   // TEX_URL: UI用の個別画像 / TILE_IMG: タイルの元画像(ミップ生成用)
+TEX_NAMES.forEach((n,i)=>{
+  const img=paintTexture(n,TEXTURES[n]);TILE_IMG[i]=img;
+  atlasCtx.putImageData(img,(i%ATLAS_COLS)*TILE,Math.floor(i/ATLAS_COLS)*TILE);
+  const c=document.createElement('canvas');c.width=c.height=TILE;
+  c.getContext('2d').putImageData(img,0,0);TEX_URL[n]=c.toDataURL();
+});
+// ---------- ミップマップ ----------
+// 各タイルを独立して縮小し、隣のタイルの色が混ざらないミップマップを作る
+const TILE_HASA=TILE_IMG.map(img=>{
+  const d=img.data;
+  for(let o=3;o<d.length;o+=4)if(d[o]<255)return 1;
+  return 0;
+});
+const TILE_COV=TILE_IMG.map((img,i)=>{
+  if(!TILE_HASA[i])return 0;
+  const d=img.data;let n=0;
+  for(let o=3;o<d.length;o+=4){
+    if(d[o]!==0&&d[o]!==255)return 0;
+    if(d[o]===255)n++;
+  }
+  return n/(TILE*TILE);
+});
+function tileMip(img,size){
+  const o=new ImageData(size,size),sw=img.width;
+  for(let y=0;y<size;y++)for(let x=0;x<size;x++){
+    let r=0,g=0,b=0,a=0;
+    for(let dy=0;dy<2;dy++)for(let dx=0;dx<2;dx++){
+      const i=((y*2+dy)*sw+x*2+dx)*4,w=img.data[i+3];
+      r+=img.data[i]*w;
+      g+=img.data[i+1]*w;
+      b+=img.data[i+2]*w;
+      a+=w;
+    }
+    const k=(y*size+x)*4;
+    if(a>0){
+      o.data[k]=r/a;
+      o.data[k+1]=g/a;
+      o.data[k+2]=b/a;
+    }
+    o.data[k+3]=a/4;
+  }
+  return o;
+}
+function keepCoverage(img,cov){
+  const d=img.data,a=[];
+  for(let o=3;o<d.length;o+=4)a.push(d[o]);
+  const cnt=Math.round(cov*a.length);
+  a.sort((p,q)=>q-p);
+  const sc=cnt>0?127.5/Math.max(a[cnt-1],1):0;
+  for(let o=3;o<d.length;o+=4)d[o]=Math.min(255,d[o]*sc);
+}
+const MIP_TILE_MAX=Math.log2(TILE)-1;   // タイル最小解像度を2x2ピクセルまでに制限
+const MIP_LEVELS=[atlasCanvas];
+{
+  let cur=TILE_IMG.slice(),ts=TILE;
+  while(ts>1){
+    ts>>=1;
+    cur=cur.map((img,i)=>{
+      const m=tileMip(img,ts);
+      if(TILE_COV[i])keepCoverage(m,TILE_COV[i]);
+      return m;
+    });
+    const cv=document.createElement('canvas');
+    cv.width=ATLAS_COLS*ts;
+    cv.height=ATLAS_ROWS*ts;
+    const cx=cv.getContext('2d');
+    cur.forEach((m,i)=>{
+      cx.putImageData(m,(i%ATLAS_COLS)*ts,Math.floor(i/ATLAS_COLS)*ts);
+    });
+    MIP_LEVELS.push(cv);
+  }
+  // ここで終了。タイル同士を混ぜる追加ミップマップは生成しない
+}
+const atlas=new THREE.CanvasTexture(atlasCanvas);
+atlas.magFilter=THREE.NearestFilter;
+atlas.minFilter=THREE.NearestMipmapLinearFilter;
+atlas.generateMipmaps=false;
+atlas.mipmaps=MIP_LEVELS;
+
+// WebGL2で最大ミップレベルを「タイルが1ピクセルになる段」に制限する
+// r128のonUpdateはテクスチャのアップロード時に呼ばれる
+atlas.onUpdate=()=>{
+  const gl=renderer.getContext();
+  if(gl&&gl.TEXTURE_MAX_LEVEL!==undefined){
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAX_LEVEL,MIP_TILE_MAX);
+  }
+};
+// ブロック・面ごとのUV矩形 [u0,v0,u1,v1]
+const uvOf=n=>{
+  const i=TEX_INDEX[n];
+  if(i===undefined)throw new Error(`unknown texture "${n}"`);
+  const c=i%ATLAS_COLS,r=Math.floor(i/ATLAS_COLS),e=.3;   // 0.01px から 0.3px に広げてテクスチャ境界の滲みを防止
+  const w=ATLAS_COLS*TILE,h=ATLAS_ROWS*TILE;
+  return [
+    (c*TILE+e)/w,
+    1-((r+1)*TILE-e)/h,
+    ((c+1)*TILE-e)/w,
+    1-(r*TILE+e)/h
+  ];
+};
+const FACE_UV=[];
+FACE_TEX.forEach((f,id)=>{if(f)FACE_UV[id]={top:uvOf(f.top),bottom:uvOf(f.bottom),side:uvOf(f.side)}});
+const TREE_LOD_UV=uvOf('tree_lod');
+// 切り抜き(葉・植物など: 透明ピクセルを持つタイルを使う非半透明ブロック)は別メッシュ・別マテリアルで描く。それ以外はアルファテスト不要
+const CUT=new Uint8Array(256);
+function calcCut(id){const f=FACE_TEX[id];CUT[id]=!TRANS[id]&&f&&(CROSS[id]||[f.top,f.bottom,f.side].some(n=>TILE_HASA[TEX_INDEX[n]]))?1:0}
+for(const b of Object.values(BLOCKS))calcCut(b.id);
+const BEDROCK_ID=ID.bedrock;
+// バイオーム定義 → Worker 用の数値表(ブロック名→ID、層の深さ→累積、川バイオーム名→番号)
+const BIOME_NAMES=Object.keys(BIOMES);
+const BIO=BIOME_NAMES.map(n=>{const b=BIOMES[n],chk=k=>{if(ID[k]===undefined)throw new Error(`biome ${n}: unknown block "${k}"`);return ID[k]};
+  if(b.river&&!BIOMES[b.river])throw new Error(`biome ${n}: unknown river "${b.river}"`);
+  return {name:n,label:b.label||n,domain:b.domain,climate:b.climate||{c:0,t:0,h:0},terrain:b.terrain||{offset:0,amp:1},river:b.river?BIOME_NAMES.indexOf(b.river):-1,
+    structs:b.structures||{},tint:b.waterTint?hexRGB(b.waterTint).map(v=>v/255):[1,1,1],
+    foliageTint:b.foliageTint?hexRGB(b.foliageTint).map(v=>v/255):[1,1,1],
+    surface:b.surface.map(r=>{let acc=0;return {when:r.when,layers:r.layers.map(l=>({id:chk(l.block),end:l.depth==null?null:acc+=l.depth}))}})}});
+
+// ---------- ブロック破壊パーティクル用の色キャッシュ ----------
+const BLOCK_COLOR_CACHE=new Map();
+function getBlockColor(id){
+  if(BLOCK_COLOR_CACHE.has(id))return BLOCK_COLOR_CACHE.get(id);
+  const fu=FACE_UV[id];
+  if(!fu){const c=new THREE.Color(0xffffff);BLOCK_COLOR_CACHE.set(id,c);return c}
+  const u=(fu.side[0]+fu.side[2])/2,v=(fu.side[1]+fu.side[3])/2;
+  const x=Math.floor(u*atlasCanvas.width),y=Math.floor((1-v)*atlasCanvas.height);   // UVのvは下が0、canvasのyは上が0
+  let d=atlasCtx.getImageData(x,y,1,1).data;
+  if(d[3]<128){   // 透明な隙間に当たったら、タイル内の不透明ピクセルの平均色を使う
+    const t=atlasCtx.getImageData(Math.floor(x/TILE)*TILE,Math.floor(y/TILE)*TILE,TILE,TILE).data;let r=0,g=0,b=0,n=0;
+    for(let i=0;i<t.length;i+=4)if(t[i+3]>=128){r+=t[i];g+=t[i+1];b+=t[i+2];n++}
+    d=n?[r/n,g/n,b/n]:[255,255,255];
+  }
+  const col=new THREE.Color(d[0]/255,d[1]/255,d[2]/255);
+  BLOCK_COLOR_CACHE.set(id,col);return col;
+}
+
+
+// ================= ワールドエンジン =================
+// 設計(最適化版):
+// 1. 完全決定論的生成: 自然地形はシード値と数式で即座に再現できるため一切保存しない(容量0バイト)。
+// 2. 差分保存: プレイヤーが破壊・設置したチャンク(modified===true)のみを永続化。
+// 3. テレイン・ブレンディング: 生成器の更新時、保存された編集領域の外周エッジと新地形の高さを
+//    Smoothstep で滑らかに繋ぐ。旧世代コードを保持し続けずに断崖絶壁を防ぐ。
+// 4. 定数メモリ保証(O(1)): LRU管理により、遠く離れたチャンクは確実にメモリから解放。
+// 5. 重い処理(地形生成・ストラクチャー配置・ライティング・メッシュ生成)は Web Worker に委託。メインスレッドは描画・物理・編集だけ。
+const GEN_VERSION=2;   // 2: バイオーム・海・川を導入
+let SEED=CONFIG.seed??(Date.now()&0x7fffffff);
+
+// 二段Map。560兆座標でもキーのビット落ちを起こさない
+class ChunkMap{
+  constructor(){this.m=new Map();this.size=0}
+  get(cx,cz){const r=this.m.get(cx);return r&&r.get(cz)}
+  set(cx,cz,v){let r=this.m.get(cx);if(!r)this.m.set(cx,r=new Map());if(!r.has(cz))this.size++;r.set(cz,v)}
+  delete(cx,cz){const r=this.m.get(cx);if(!r||!r.delete(cz))return;this.size--;if(!r.size)this.m.delete(cx)}
+  values(){const a=[];for(const r of this.m.values())for(const c of r.values())a.push(c);return a}
+  clear(){this.m.clear();this.size=0}
+}
+
+// メインスレッド側のチャンク: 物理・レイキャスト・編集・保存のための「ブロックデータ」と、描画用メッシュだけを持つ。
+// 地形生成とライティングはワーカー側(light 配列もワーカーだけが持つ)。
+class Chunk{
+  constructor(cx,cz,data){
+    this.cx=cx;this.cz=cz;
+    this.data=data;                      // [y*256 + lz*16 + lx](ワーカーから受け取ったコピー)
+    this.lo=H;this.hi=0;                 // lo: 列の最低地表Y / hi: 最高のブロックY
+    this.gen=GEN_VERSION;
+    this.shown=false;
+    this.modified=false;                 // ★ プレイヤーが手を加えたか(建築・採掘)
+    this.dirty=false;                    // ★ ストレージ保存待ちか
+    this.lod=0;this.mesh=null;this.meshed=false;    // meshed: メッシュ結果を受け取った(空メッシュも含む)
+    this.want=false;                     // want: メッシュ要求済み/表示中
+  }
+}
+
+// ---------- Perlin noise ----------
+function mulberry(a){return()=>{a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+if(!Number.isInteger(CONFIG.terrain.scale))throw new Error('terrain.scale は整数にしてください(厳密な格子計算のため)');
+
+// ---------- World: チャンクのストアとオンデマンド生成 ----------
+// 世界の端: 2^49 ≈ 5.629 × 10^14 (560兆ブロック)
+const COORD_LIMIT=2**(53-CONFIG.terrain.octaves);
+const world={
+  chunks:new ChunkMap(),   // 現在メモリに展開されているアクティブチャンク
+  store:new ChunkMap(),    // プレイヤーが手を加えた(modified===true)チャンクの保存記録
+  changed:new ChunkMap(),  // ストレージ(IndexedDB)書き込み待ちの記録
+  hasLegacy:false,last:null,
+  inBounds:(cx,cz)=>CONFIG.world.infinite?Math.abs(cx)*16<=COORD_LIMIT&&Math.abs(cz)*16<=COORD_LIMIT:(cx>=0&&cz>=0&&cx<CN&&cz<CN),
+  // 読み込み済みのチャンクだけを返す(生成はワーカーに頼むので、ここでは生成しない)。未読み込みは null
+  chunk(cx,cz){
+    const l=this.last; if(l&&l.cx===cx&&l.cz===cz)return l;
+    const c=this.chunks.get(cx,cz); if(!c)return null;
+    return this.last=c;
+  },
+  get(x,y,z){            // 未読み込みの場所は空気
+    if(y<0)return BEDROCK_ID; if(y>=H)return 0;
+    const cx=Math.floor(x/16),cz=Math.floor(z/16),c=this.chunk(cx,cz);
+    return c?c.data[y*256+((z-cz*16)<<4)+(x-cx*16)]:0;
+  },
+  solid(x,y,z){          // 未読み込みの場所は壁(落下防止)
+    if(y<0)return true;
+    const cx=Math.floor(x/16),cz=Math.floor(z/16),c=this.chunk(cx,cz); if(!c)return true;
+    return y<H&&SOLID[c.data[y*256+((z-cz*16)<<4)+(x-cx*16)]]===1;
+  }
+};
+const get=(x,y,z)=>world.get(x,y,z),solid=(x,y,z)=>world.solid(x,y,z);
+world.structuresIn=(cx,cz)=>{const c=world.chunks.get(cx,cz);return c&&c.structs||[]};   // そのチャンクに掛かる構造物 [{n,x,y,z,r}](決定論的に再現されるので保存不要)
+
+// ---------- Structures: データ → 配置 ----------
+function rot(x,z,r){return r===0?[x,z]:r===1?[-z,x]:r===2?[-x,-z]:[z,-x]}   // ワーカー側でも使う(宣言のまま文字列化して埋め込む)
+function compileStructure(name,def){
+  const cells=[],columns=[],seen=new Set();
+  def.layers.forEach((rows,dy)=>rows.forEach((row,dz)=>[...row].forEach((ch,dx)=>{
+    const b=def.palette[ch]; if(b===undefined)return;
+    if(!(b in ID))throw new Error(`structure ${name}: unknown block "${b}"`);
+    const c={x:dx-def.origin[0],y:dy-def.origin[1],z:dz-def.origin[2],id:ID[b]};
+    cells.push(c);
+    const k=c.x+','+c.z; if(!seen.has(k)){seen.add(k);columns.push([c.x,c.z])}
+  })));
+  return {...def,name,cells,columns};
+}
+const STRUCT={};
+for(const [n,d] of Object.entries(STRUCTURES))STRUCT[n]=compileStructure(n,d);
+
+function placeStructure(S,ox,oy,oz,r=0,write=setBlock){
+  for(const c of S.cells){
+    const [dx,dz]=rot(c.x,c.z,r),x=ox+dx,y=oy+c.y,z=oz+dz;
+    if(!S.overwrite&&get(x,y,z)!==0)continue;
+    write(x,y,z,c.id);
+  }
+}
+const STRUCT_LIST=Object.values(STRUCT).filter(S=>S.spawn);
+
+// ================= チャンクエンジン(Web Worker 側で動く) =================
+// 地形生成・ストラクチャー配置・ライティング・メッシュ生成をここに集約。メインスレッドは描画と操作だけを担当する。
+//  - この関数は文字列化されて Worker のソースになる(外部ファイル不要)。Worker が使えない環境では同じ関数をメインスレッドで動かす。
+//  - 関数の外側の変数は参照しないこと(使えるのは ChunkMap と rot のみ。Worker 起動時に一緒に埋め込まれる)。
+//  - ワーカー内にチャンクの「鏡」(data + light)を持つ。メインのブロック変更は 'edit' メッセージで同じ順序で反映される。
+// メッセージ(メイン → エンジン): init / tables / world / store / center / load / mesh / edit
+// メッセージ(エンジン → メイン): ready / chunk(データ+メッシュ) / mesh(メッシュのみ) / fail
+function chunkEngine(post){
+  const fade=t=>t*t*t*(t*(t*6-15)+10),lerp=(t,a,b)=>a+t*(b-a),smoothstep=t=>t<=0?0:t>=1?1:t*t*(3-2*t);
+  const grad=(h,x,y)=>{switch(h&3){case 0:return x+y;case 1:return -x+y;case 2:return x-y;default:return -x-y}};
+  let CFG,H=256,GEN=1,ID,LIGHT,CUT,CROSS,BEDROCK_ID=0,LAYERS=[],FACES=[],FACE_UV=[],TREE_LOD_UV=null,GRASS_SIDE_OVERLAY_UV=null,OPAQUE,SOLID,CULL,LIGHTBLOCK,CN=0,COORD_LIMIT=0;
+  let STRUCT_LIST=[],MAX_REACH=0,MAX_GAP=0;
+  let WG,BIO=[],SEA=0,WATER=0,TINT=[],FOLIAGE_TINT=[],BIO_O=[],BIO_L=[],TRANS,FLUID,FLUIDH;
+  let SEED=0,epoch=0,hasLegacy=false,store=new ChunkMap(),chunks=new ChunkMap(),last=null;
+  const q0=[],q1=[],uq=new Set();   // q0: ブロック編集の再メッシュ(最優先) / q1: ストリーミング要求
+
+  function setTables(t){CUT=t.CUT.slice();TRANS=t.TRANS.slice();FLUID=t.FLUID.slice();FLUIDH=t.FLUIDH.slice();CROSS=t.CROSS.slice();OPAQUE=t.OPAQUE.slice();SOLID=t.SOLID.slice();CULL=t.CULL.slice();LIGHTBLOCK=t.LIGHTBLOCK.slice();FACE_UV=t.FACE_UV;TREE_LOD_UV=t.TREE_LOD_UV;GRASS_SIDE_OVERLAY_UV=t.GRASS_SIDE_OVERLAY_UV}
+  function init(m){
+    CFG=m.config;H=CFG.world.height;LIGHT=CFG.lighting;GEN=m.genVersion;ID=m.ID;BEDROCK_ID=ID.bedrock;
+    CN=CFG.world.chunks;COORD_LIMIT=2**(53-CFG.terrain.octaves);
+    setTables(m.tables);
+    let acc=0;LAYERS=CFG.terrain.layers.map(l=>({id:ID[l.block],end:l.depth==null?null:acc+=l.depth}));
+    FACES=[
+      {k:'side',d:[1,0,0],v:[[1,0,1],[1,0,0],[1,1,0],[1,1,1]],s:LIGHT.faces.x},
+      {k:'side',d:[-1,0,0],v:[[0,0,0],[0,0,1],[0,1,1],[0,1,0]],s:LIGHT.faces.x},
+      {k:'top',d:[0,1,0],v:[[0,1,1],[1,1,1],[1,1,0],[0,1,0]],s:LIGHT.faces.top},
+      {k:'bottom',d:[0,-1,0],v:[[0,0,0],[1,0,0],[1,0,1],[0,0,1]],s:LIGHT.faces.bottom},
+      {k:'side',d:[0,0,1],v:[[0,0,1],[1,0,1],[1,1,1],[0,1,1]],s:LIGHT.faces.z},
+      {k:'side',d:[0,0,-1],v:[[1,0,0],[0,0,0],[0,1,0],[1,1,0]],s:LIGHT.faces.z}
+    ];
+    WG=m.wg;BIO=m.bio;SEA=WG.seaLevel;WATER=ID.water;TINT=BIO.map(b=>b.tint);FOLIAGE_TINT=BIO.map(b=>b.foliageTint||[1,1,1]);BIO_O=[];BIO_L=[];
+    BIO.forEach((b,i)=>{if(b.domain==='ocean')BIO_O.push(i);else if(b.domain==='land')BIO_L.push(i)});
+    STRUCT_LIST=m.structs.map(S=>({...S,maxChance:Math.max(S.spawn.chance,...BIO.map(b=>b.structs[S.name]||0)),onIds:new Set(S.spawn.on.map(n=>ID[n])),reach:Math.max(...S.columns.map(([x,z])=>Math.max(Math.abs(x),Math.abs(z))))}));
+    MAX_REACH=Math.max(0,...STRUCT_LIST.map(S=>S.reach));MAX_GAP=Math.max(0,...STRUCT_LIST.map(S=>S.spawn.spacing||0));
+  }
+  const inBounds=(cx,cz)=>CFG.world.infinite?Math.abs(cx)*16<=COORD_LIMIT&&Math.abs(cz)*16<=COORD_LIMIT:(cx>=0&&cz>=0&&cx<CN&&cz<CN);
+  const layerAt=d=>{for(const l of LAYERS)if(l.end==null||d<l.end)return l.id;return BEDROCK_ID};
+  const newChunk=(cx,cz)=>({cx,cz,biome:new Uint8Array(256),data:new Uint8Array(16*H*16),light:new Int16Array(256),lo:H,hi:0,gen:GEN,modified:false});
+
+  // ---------- 地形(元コードのまま) ----------
+  function hash3(x,z,k){   // Math.imul は下位32bitだけ見るので、上位32bitも別に混ぜる(560兆スケール対応)
+    const xh=Math.floor(x/4294967296),zh=Math.floor(z/4294967296);
+    let h=(Math.imul(x,374761393)+Math.imul(z,668265263)+Math.imul(k,1442695041)+Math.imul(xh,1274126177)+Math.imul(zh,2246822519)+SEED)|0;
+    h=Math.imul(h^(h>>>13),1274126177);return((h^(h>>>16))>>>0)/4294967296}
+  const lat=(X,Y,s)=>(hash3(X,Y,s)*4)|0;
+
+  function perlin(X,fx,Y,fy,s){
+    const u=fade(fx),v=fade(fy);
+    return lerp(v,lerp(u,grad(lat(X,Y,s),fx,fy),grad(lat(X+1,Y,s),fx-1,fy)),lerp(u,grad(lat(X,Y+1,s),fx,fy-1),grad(lat(X+1,Y+1,s),fx-1,fy-1)));
+  }
+  // ---------- 気候・バイオーム・川 ----------
+  function fbm(x,z,sc,oct,salt){   // 元の rawHeight と同じ計算(salt=64 なら従来の地形ノイズ)
+    let n=0,a=1,s=0;
+    for(let i=0;i<oct;i++){
+      const nx=x*(1<<i),nz=z*(1<<i);
+      let rx=nx%sc,rz=nz%sc;if(rx<0)rx+=sc;if(rz<0)rz+=sc;
+      n+=perlin((nx-rx)/sc+100,rx/sc,(nz-rz)/sc+100,rz/sc,salt+i)*a;s+=a;a*=.5;
+    }
+    return n/s;
+  }
+  const curve=(p,x)=>{if(x<=p[0][0])return p[0][1];for(let i=1;i<p.length;i++)if(x<=p[i][0]){const a=p[i-1],b=p[i];return a[1]+(b[1]-a[1])*(x-a[0])/(b[0]-a[0])}return p[p.length-1][1]};
+  function pick(c,t,hu){   // ドメイン内で気候空間の距離が最も近いバイオーム
+    const L=c<WG.oceanThreshold?BIO_O:BIO_L;let bi=L[0],bd=1e9;
+    for(const i of L){const k=BIO[i].climate,d=(c-k.c)**2*2+(t-k.t)**2+(hu-k.h)**2;if(d<bd){bd=d;bi=i}}
+    return bi;
+  }
+  const cc=new Map();   // 4ブロック格子の気候キャッシュ(絶対座標基準なのでチャンク境界で継ぎ目が出ない)
+  function corner(gx,gz){
+    const k=gx+','+gz;let v=cc.get(k);if(v)return v;if(cc.size>16384)cc.clear();
+    const x=gx*4,z=gz*4,C=WG.climate,f=o=>Math.max(-1,Math.min(1,fbm(x,z,o.scale,o.octaves,o.salt)*o.gain));
+    v={c:f(C.c),t:f(C.t),h:f(C.h),r:f(C.ridge)};
+    const T=BIO[pick(v.c,v.t,v.h)].terrain;v.o=T.offset;v.a=T.amp;cc.set(k,v);return v;
+  }
+  function blendOf(gx,gz){   // 隣接3x3格子のバイオーム地形パラメータを平均(境界の崖を防ぐ)
+    const v=corner(gx,gz);
+    if(v.bo===undefined){let o=0,a=0;for(let j=-1;j<=1;j++)for(let i=-1;i<=1;i++){const q=corner(gx+i,gz+j);o+=q.o;a+=q.a}v.bo=o/9;v.ba=a/9}
+    return v;
+  }
+  function column(x,z){   // → {h:地表の高さ, b:バイオーム番号}
+    const gx=Math.floor(x/4),gz=Math.floor(z/4),u=(x-gx*4)/4,w=(z-gz*4)/4;
+    const A=blendOf(gx,gz),B=blendOf(gx+1,gz),C=blendOf(gx,gz+1),D=blendOf(gx+1,gz+1);
+    const bl=k=>lerp(w,lerp(u,A[k],B[k]),lerp(u,C[k],D[k]));
+    const c=bl('c'),T=CFG.terrain,R=WG.river,r=Math.abs(bl('r'));
+    let h=curve(WG.baseCurve,c)+fbm(x,z,T.scale,T.octaves,64)*T.amplitude*curve(WG.ampCurve,c)*bl('ba')+bl('bo'),bi=pick(c,bl('t'),bl('h'));
+    // 海・大湖（oceanThreshold）に近づくにつれて川の影響を 0 に減衰させるフェードアウトを追加
+    const oceanFade = smoothstep((c - WG.oceanThreshold) / 0.08);
+    const f=smoothstep((c-R.cRange[0])/.1)*(1-smoothstep((c-R.cRange[1]+.1)/.1)) * oceanFade;   // 川が現れる大陸度の帯
+    if(f>0&&r<R.bankWidth){
+      const bank=1-smoothstep(r/R.bankWidth),bed=1-smoothstep(r/R.width);
+      h+=(Math.min(h,SEA+R.bankHeight)-h)*f*bank;   // 土手: 海面付近まで低くなだらかに
+      h+=(SEA-R.depth-h)*f*bed;                      // 川床
+      if(f*bed>.5&&BIO[bi].river>=0)bi=BIO[bi].river;
+    }
+    return {h:Math.max(T.min,Math.min(T.max,Math.round(h))),b:bi};
+  }
+  function rule(bi,x,z,h){   // 表層ルール: 最初に条件が合ったものを返す
+    const S=BIO[bi].surface,a=h-SEA;
+    for(let k=0;k<S.length;k++){
+      const w=S[k].when;
+      if(w){
+        if(w.aboveSea&&(a<w.aboveSea[0]||a>w.aboveSea[1]))continue;
+        if(w.y&&(h<w.y[0]||h>w.y[1]))continue;
+        if(w.patch&&fbm(x,z,w.patch.scale,2,300+bi*16+k)<w.patch.min)continue;
+      }
+      return S[k];
+    }
+    return S[S.length-1];
+  }
+  const layOf=(ly,d)=>{for(const l of ly)if(l.end==null||d<l.end)return l.id;return BEDROCK_ID};
+  function height(x,z,col){
+    const h=(col||column(x,z)).h;
+    if(!hasLegacy||store.size===0)return h;
+    // 近傍に保存された旧チャンクがあるか確認(半径blendRadiusブロック以内)
+    const R=CFG.terrain.blendRadius||32,cx=Math.floor(x/16),cz=Math.floor(z/16);
+    const minCx=Math.floor((x-R)/16),maxCx=Math.floor((x+R)/16),minCz=Math.floor((z-R)/16),maxCz=Math.floor((z+R)/16);
+    let minDist=Infinity,anchorY=h;
+    for(let bz=minCz;bz<=maxCz;bz++)for(let bx=minCx;bx<=maxCx;bx++){
+      const rec=store.get(bx,bz);
+      if(rec){
+        const cxDist=Math.max(0,Math.abs(x-(bx*16+8))-8),czDist=Math.max(0,Math.abs(z-(bz*16+8))-8);
+        const d=Math.hypot(cxDist,czDist);
+        if(d<minDist){minDist=d;anchorY=rec.hi}
+      }
+    }
+    if(minDist>=R)return h;
+    const t=smoothstep(minDist/R);
+    return Math.max(CFG.terrain.min,Math.min(CFG.terrain.max,Math.round(lerp(t,anchorY,h))));
+  }
+  // ---------- ストラクチャー配置・ライティング ----------
+  function candidate(x,z,i){
+    const S=STRUCT_LIST[i],sp=S.spawn;
+    const hv=hash3(x,z,i*4);if(hv>=S.maxChance)return null;
+    const col=column(x,z),ch=BIO[col.b].structs[S.name]??S.spawn.chance;if(hv>=ch)return null;
+    const r=sp.rotate?Math.floor(hash3(x,z,i*4+1)*4):0,gy=height(x,z,col);
+    if(gy<=SEA||!S.onIds.has(rule(col.b,x,z,gy).layers[0].id))return null;   // 水中・浜辺には生やさない
+    let mn=1e9,mx=-1e9;
+    for(const [cx,cz] of S.columns){
+      const [dx,dz]=rot(cx,cz,r),px=x+dx,pz=z+dz;
+      if(!inBounds(Math.floor(px/16),Math.floor(pz/16)))return null;
+      const h=height(px,pz); if(h<=SEA)return null; if(h<mn)mn=h; if(h>mx)mx=h;
+    }
+    if(mx-mn>(sp.maxSlope??Infinity))return null;
+    return {S,x,z,y:gy+1,r,pri:hash3(x,z,i*4+2),gap:sp.spacing||0};
+  }
+  function accepted(x,z,i){
+    const c=candidate(x,z,i); if(!c)return null;
+    for(let dz=-MAX_GAP;dz<=MAX_GAP;dz++)for(let dx=-MAX_GAP;dx<=MAX_GAP;dx++)for(let j=0;j<STRUCT_LIST.length;j++){
+      if(!dx&&!dz&&j===i)continue;
+      const o=candidate(x+dx,z+dz,j); if(!o)continue;
+      if(Math.max(Math.abs(dx),Math.abs(dz))<Math.max(c.gap,o.gap)&&(o.pri>c.pri||(o.pri===c.pri&&(o.x<c.x||(o.x===c.x&&o.z<c.z)))))return null;
+    }
+    return c;
+  }
+  function structuresNear(cx,cz){
+    const out=[],R=MAX_REACH;
+    for(let z=cz*16-R;z<cz*16+16+R;z++)for(let x=cx*16-R;x<cx*16+16+R;x++)
+      for(let i=0;i<STRUCT_LIST.length;i++){const a=accepted(x,z,i);if(a)out.push(a)}
+    return out.filter(p=>!legacyBlocked(p)).sort((a,b)=>b.pri-a.pri||a.x-b.x||a.z-b.z);
+  }
+  function legacyBlocked(p){
+    if(!hasLegacy)return false;
+    const r=p.S.reach,x0=Math.floor((p.x-r)/16),x1=Math.floor((p.x+r)/16),z0=Math.floor((p.z-r)/16),z1=Math.floor((p.z+r)/16);
+    for(let z=z0;z<=z1;z++)for(let x=x0;x<=x1;x++){const rec=store.get(x,z);if(rec&&rec.gen!==GEN)return true}
+    return false;
+  }
+  function placeInChunk(c,p){
+    const S=p.S;
+    for(const k of S.cells){
+      const [dx,dz]=rot(k.x,k.z,p.r),x=p.x+dx,y=p.y+k.y,z=p.z+dz;
+      const lx=x-c.cx*16,lz=z-c.cz*16;
+      if(lx<0||lx>15||lz<0||lz>15||y<0||y>=H)continue;
+      const o=y*256+(lz<<4)+lx;
+      if(c.data[o]!==0&&!S.overwrite)continue;
+      c.data[o]=k.id; if(y>c.hi)c.hi=y;
+    }
+  }
+  function calcLightColumn(c,lx,lz){
+    const o=(lz<<4)+lx;let y=c.hi;
+    while(y>0&&!LIGHTBLOCK[c.data[y*256+o]])y--;
+    c.light[o]=y;
+  }
+  // ---------- チャンクの生成/復元 ----------
+  function generateChunk(cx,cz){
+    const c=newChunk(cx,cz),d=c.data,x0=cx*16,z0=cz*16;let mn=H,mx=0;
+    for(let lz=0;lz<16;lz++)for(let lx=0;lx<16;lx++){
+      const X=x0+lx,Z=z0+lz,col=column(X,Z),h=height(X,Z,col),ly=rule(col.b,X,Z,h).layers;
+      c.biome[lz*16+lx]=col.b;
+      for(let y=0;y<=h;y++)d[y*256+lz*16+lx]=y===0?BEDROCK_ID:layOf(ly,h-y);
+      for(let y=h+1;y<=SEA;y++)d[y*256+lz*16+lx]=WATER;
+      if(h<SEA&&SEA>mx)mx=SEA;
+      if(h<mn)mn=h; if(h>mx)mx=h;
+    }
+    c.lo=mn;c.hi=mx;
+    const ps=structuresNear(cx,cz);for(const p of ps)placeInChunk(c,p);
+    c.structs=ps.filter(p=>p.x+p.S.reach>=x0&&p.x-p.S.reach<x0+16&&p.z+p.S.reach>=z0&&p.z-p.S.reach<z0+16).map(p=>({n:p.S.name,x:p.x,y:p.y,z:p.z,r:p.r}));
+    for(let lz=0;lz<16;lz++)for(let lx=0;lx<16;lx++)calcLightColumn(c,lx,lz);
+    return c;
+  }
+  function decodeChunk(cx,cz,rec){
+    const c=newChunk(cx,cz),d=c.data,b=rec.b;let p=0,i=0;
+    while(p<b.length){
+      const v=b[p++];let r=0,s=0,x;
+      do{x=b[p++];r|=(x&127)<<s;s+=7}while(x&128);
+      d.fill(v,i,i+r);i+=r;
+    }
+    for(let lz=0;lz<16;lz++)for(let lx=0;lx<16;lx++)c.biome[lz*16+lx]=column(cx*16+lx,cz*16+lz).b;
+    c.hi=rec.hi;c.lo=rec.lo;c.gen=rec.gen;
+    c.modified=true;   // 復元されたデータは編集済みチャンク
+    for(let lz=0;lz<16;lz++)for(let lx=0;lx<16;lx++)calcLightColumn(c,lx,lz);
+    return c;
+  }
+  // メモリ上の鏡。無ければ「保存記録から復元 or 新規生成」(元コードの world.chunk と同じ)
+  function ensure(cx,cz){
+    if(last&&last.cx===cx&&last.cz===cz&&last.data)return last;
+    if(!inBounds(cx,cz))return null;
+    let c=chunks.get(cx,cz);
+    if(!c||!c.data){   // 無い、またはトリム済み(列データだけ)なら 保存記録から復元 or 再生成
+      const o=c,r=store.get(cx,cz);c=r?decodeChunk(cx,cz,r):generateChunk(cx,cz);
+      if(o){c.lod=o.lod;if(!c.modified)c.fc=o.fc}
+      chunks.set(cx,cz,c);
+    }
+    return last=c;
+  }
+
+  // ---------- メッシュ生成(THREE には触らず、型付き配列だけ作って返す) ----------
+  // 不透明(bufO)と切り抜き(bufK: 葉・植物)は別メッシュ。前者はアルファテスト無しで描ける
+  const mkBuf=()=>({cap:0,P:null,C:null,U:null,I:null,nv:0,ni:0,y0:0,y1:0}),bufO=mkBuf(),bufK=mkBuf();
+  const TREE_NAMES=new Set(['oak','birch','smallTree']);
+  function treeRecords(c){
+    if(c.structs)return c.structs;
+    if(c._lodTrees)return c._lodTrees;
+    const x0=c.cx*16,z0=c.cz*16;
+    c._lodTrees=structuresNear(c.cx,c.cz).filter(p=>TREE_NAMES.has(p.S.name)&&p.x+p.S.reach>=x0&&p.x-p.S.reach<x0+16&&p.z+p.S.reach>=z0&&p.z-p.S.reach<z0+16)
+      .map(p=>({n:p.S.name,x:p.x,y:p.y,z:p.z,r:p.r}));
+    return c._lodTrees;
+  }
+  function treeCellsInChunk(c){
+    const cells=new Map();if(!c.data)return cells;
+    const x0=c.cx*16,z0=c.cz*16;
+    for(const p of treeRecords(c)){
+      if(!TREE_NAMES.has(p.n))continue;
+      const S=STRUCT_LIST.find(v=>v.name===p.n);if(!S)continue;
+      for(const k of S.cells){
+        if(k.id!==ID.log&&k.id!==ID.birch_log&&k.id!==ID.leaves)continue;
+        const [dx,dz]=rot(k.x,k.z,p.r||0),x=p.x+dx,z=p.z+dz,y=p.y+k.y,lx=x-x0,lz=z-z0;
+        if(lx<0||lx>15||lz<0||lz>15||y<0||y>=H)continue;
+        const idx=y*256+(lz<<4)+lx;
+        if(c.data[idx]===k.id)cells.set(idx,k.id);
+      }
+    }
+    return cells;
+  }
+  function treeInfo(name){
+    if(name==='birch')return {trunk:ID.birch_log,trunkH:4};
+    if(name==='smallTree')return {trunk:ID.log,trunkH:1};
+    if(name==='oak')return {trunk:ID.log,trunkH:3};
+    return null;
+  }
+  function treeAlive(p,info){
+    const cx=Math.floor(p.x/16),cz=Math.floor(p.z/16),owner=chunks.get(cx,cz);
+    if(!owner||!owner.data)return true;
+    const lx=p.x-cx*16,lz=p.z-cz*16;
+    return p.y>=0&&p.y<H&&owner.data[p.y*256+(lz<<4)+lx]===info.trunk;
+  }
+  function growScratch(B,n){
+    const k=Math.max(n,B.cap*2,16384),P=new Float32Array(k*3),C=new Uint8Array(k*3),U=new Float32Array(k*2),I=new Uint32Array(Math.ceil(k*3));
+    if(B.cap){P.set(B.P);C.set(B.C);U.set(B.U);I.set(B.I)}
+    B.P=P;B.C=C;B.U=U;B.I=I;B.cap=k;
+  }
+  const packBuf=B=>B.nv?{nv:B.nv,P:B.P.slice(0,B.nv*3),C:B.C.slice(0,B.nv*3),U:B.U.slice(0,B.nv*2),I:B.nv>65535?B.I.slice(0,B.ni):Uint16Array.from(B.I.subarray(0,B.ni)),
+    bs:[8,(B.y0+B.y1)/2,8,Math.hypot(8,8,(B.y1-B.y0)/2)]}:null;   // 視錐台カリング用の境界球もここで計算
+  // 遠景に必要な列データ(約1.5KB): 地表の高さ/種類、水面の高さ/種類。これだけあれば遠景メッシュを作り直せるので、フルデータ(64KB)は手放せる
+  function farColumns(c){
+    const d=c.data,h=new Int16Array(256).fill(-1),t=new Uint8Array(256),w=new Int16Array(256).fill(-1),wt=new Uint8Array(256),treeCells=treeCellsInChunk(c);
+    for(let col=0;col<256;col++){
+      for(let y=c.hi;y>=c.lo;y--){
+        const idx=y*256+col,b=d[idx];if(!b)continue;
+        if(treeCells.has(idx)&&treeCells.get(idx)===b)continue; // 生成木の葉・幹は地形表面として採用しない
+        if(TRANS[b]){if(FLUID[b]&&w[col]<0){w[col]=y;wt[col]=b}}
+        else{h[col]=y;t[col]=b;break}
+      }
+    }
+    return {h,t,w,wt};
+  }
+  function trim(c){   // 編集済みでないチャンクのフルデータを捨てる(必要なら ensure が決定論的に作り直す)
+    if(c.modified||!c.data)return;
+    if(!c.fc)c.fc=farColumns(c);
+    c.data=null;c.light=null;if(last===c)last=null;
+  }
+  function buildMeshFar(c,step=1){
+    for(const B of [bufO,bufK]){if(!B.cap)growScratch(B,0);B.nv=0;B.ni=0;B.y0=H;B.y1=0}
+    const fc=c.fc||(c.fc=farColumns(c)),hMap=fc.h,tMap=fc.t,wMap=fc.w,wTy=fc.wt;
+    const N=16/step,total=N*N,gh=new Int16Array(total).fill(-1),gt=new Uint8Array(total),gw=new Int16Array(total).fill(-1),gwt=new Uint8Array(total);
+    const sample=(map,lx,lz)=>{
+      let sum=0,count=0,wy=-1,wt=0;
+      for(let dz=0;dz<step;dz++)for(let dx=0;dx<step;dx++){
+        const col=((lz+dz)<<4)+lx+dx,h=map.h[col],w=map.w[col];
+        if(h>=0){sum+=h;count++}
+        if(w>wy){wy=w;wt=map.wt[col]}
+      }
+      if(!count)return {h:-1,t:0,w:wy,wt};
+      const avg=sum/count;let best=Infinity,t=0;
+      for(let dz=0;dz<step;dz++)for(let dx=0;dx<step;dx++){
+        const col=((lz+dz)<<4)+lx+dx,h=map.h[col];if(h<0)continue;
+        const d=Math.abs(h-avg);if(d<best){best=d;t=map.t[col]}
+      }
+      return {h:Math.round(avg),t,w:wy,wt};
+    };
+    for(let gz=0;gz<N;gz++)for(let gx=0;gx<N;gx++){
+      const q=sample(fc,gx*step,gz*step),i=gz*N+gx;
+      gh[i]=q.h;gt[i]=q.t;gw[i]=q.w;gwt[i]=q.wt;
+    }
+    const edgeH=(gx,gz,y)=>{
+      const dx=gx<0?-1:gx>=N?1:0,dz=gz<0?-1:gz>=N?1:0;
+      const n=chunks.get(c.cx+dx,c.cz+dz);if(!n)return y-8;   // 隣が未生成: 少し深めのスカートで空が見えないようにする
+      const nf=n.fc||(n.data?(n.fc=farColumns(n)):null);if(!nf)return n.lo;
+      // 隣チャンクが別のLOD(平均化された高さ)でも隙間が出ないよう、境界に接する実際の列の最小の高さまで壁を伸ばす
+      let m=Infinity;
+      for(let k=0;k<step;k++){
+        const col=dx?((gz*step+k)<<4)+(dx<0?15:0):((dz<0?15:0)<<4)+gx*step+k,hv=nf.h[col];
+        if(hv>=0&&hv<m)m=hv;
+      }
+      return m===Infinity?-1:m;
+    };
+    const heightAt=(gx,gz,y)=>gx>=0&&gx<N&&gz>=0&&gz<N?gh[gz*N+gx]:edgeH(gx,gz,y);
+    const isFoliageFar = id => id === ID.grass || id === ID.leaves;
+    const emitQuad=(B,t,lx,y,lz,fi,kb,hh=1,ww=step,dd=step)=>{
+      const f=FACES[fi],fu=FACE_UV[t];if(!fu)return;
+      // LOD: 草ブロックは上面だけ草テクスチャ+バイオーム色、側面・下面は土(bottom)のテクスチャ・色をそのまま使う
+      const isG=(t===ID.grass),u=isG&&f.k!=='top'?fu.bottom:(fu[f.k]||fu.side);
+      const useTint = isG?(f.k==='top'):isFoliageFar(t);
+      const ft = useTint ? (FOLIAGE_TINT[c.biome[((lz&15)<<4)+(lx&15)]] || [1,1,1]) : [1,1,1];
+      if(B.nv+4>B.cap)growScratch(B,B.nv+4);
+      const P=B.P,C=B.C,U=B.U,I=B.I,nv=B.nv;let ni=B.ni;
+       for(let j=0;j<4;j++){
+          const v=f.v[j],o=(nv+j)*3;
+          P[o]=lx+v[0]*ww;P[o+1]=y+v[1]*hh;P[o+2]=lz+v[2]*dd;   // 格子(step×step)・壁の高さに合わせて引き伸ばす
+          C[o]=Math.round(kb*ft[0]); C[o+1]=Math.round(kb*ft[1]); C[o+2]=Math.round(kb*ft[2]);
+          U[(nv+j)*2]=j===1||j===2?u[2]:u[0];U[(nv+j)*2+1]=j>=2?u[3]:u[1];
+        }
+        I[ni++]=nv;I[ni++]=nv+1;I[ni++]=nv+2;I[ni++]=nv;I[ni++]=nv+2;I[ni++]=nv+3;B.ni=ni;B.nv=nv+4;
+        if(y<B.y0)B.y0=y; if(y+hh>B.y1)B.y1=y+hh;
+      };
+    const kbTop=Math.round(255*LIGHT.lit*LIGHT.faces.top);
+    const emitTreeFace=(uv,v,shade)=>{
+      if(!uv||!v)return;
+      if(bufO.nv+4>bufO.cap)growScratch(bufO,bufO.nv+4);
+      const P=bufO.P,C=bufO.C,U=bufO.U,I=bufO.I,nv=bufO.nv,kb=Math.max(0,Math.min(255,Math.round(255*LIGHT.lit*shade)));
+      for(let j=0;j<4;j++){
+        const q=v[j],o=(nv+j)*3;P[o]=q[0];P[o+1]=q[1];P[o+2]=q[2];C[o]=C[o+1]=C[o+2]=kb;
+        U[(nv+j)*2]=j===1||j===2?uv[2]:uv[0];U[(nv+j)*2+1]=j>=2?uv[3]:uv[1];
+        if(q[1]<bufO.y0)bufO.y0=q[1];if(q[1]>bufO.y1)bufO.y1=q[1];
+      }
+      let ni=bufO.ni;I[ni++]=nv;I[ni++]=nv+1;I[ni++]=nv+2;I[ni++]=nv;I[ni++]=nv+2;I[ni++]=nv+3;bufO.ni=ni;bufO.nv=nv+4;
+    };
+    const emitTreeTopUV=(uv,x0,x1,z0,z1,y)=>{
+      x0=Math.max(0,x0);x1=Math.min(16,x1);z0=Math.max(0,z0);z1=Math.min(16,z1);if(x1<=x0||z1<=z0)return;
+      emitTreeFace(uv,[[x0,y,z1],[x1,y,z1],[x1,y,z0],[x0,y,z0]],LIGHT.faces.top);
+    };
+    const emitTreeTop=(x0,x1,z0,z1,y)=>emitTreeTopUV(TREE_LOD_UV,x0,x1,z0,z1,y);
+    const emitTreeBox=(id,x,y,z,w,h,d,top=true,bottom=false)=>{
+      const uvByFace=FACE_UV[id];if(!uvByFace)return;
+      const x1=x+w,y1=y+h,z1=z+d;
+      const quad=(fi,v)=>{const f=FACES[fi],uv=uvByFace[f.k]||uvByFace.side;emitTreeFace(uv,v,f.s)};
+      const za=Math.max(0,z),zb=Math.min(16,z1),xa=Math.max(0,x),xb=Math.min(16,x1);
+      if(xa>=xb||za>=zb)return;
+      if(x>=0&&x<=16)quad(1,[[x,y,zb],[x,y,za],[x,y1,za],[x,y1,zb]]);
+      if(x1>=0&&x1<=16)quad(0,[[x1,y,zb],[x1,y,za],[x1,y1,za],[x1,y1,zb]]);
+      if(z>=0&&z<=16)quad(5,[[xb,y,z],[xa,y,z],[xa,y1,z],[xb,y1,z]]);
+      if(z1>=0&&z1<=16)quad(4,[[xa,y,z1],[xb,y,z1],[xb,y1,z1],[xa,y1,z1]]);
+      if(top)emitTreeTopUV(uvByFace.top||uvByFace.side,xa,xb,za,zb,y1);
+      if(bottom)emitTreeTopUV(uvByFace.bottom||uvByFace.side,xa,xb,za,zb,y);
+    };
+    const emitTreeCanopy=(lx,lz,baseY,levels)=>{
+      for(let i=0;i<levels.length;i++){
+        const a=levels[i],x0=lx-a.rx,x1=lx+a.rx+1,z0=lz-a.rz,z1=lz+a.rz+1,y=baseY+a.dy,y1=y+a.h;
+        // 側面は各帯の外周だけ。チャンク内で切られた端面は描かず、隣のチャンクへ形を繋ぐ。
+        const xa=Math.max(0,x0),xb=Math.min(16,x1),za=Math.max(0,z0),zb=Math.min(16,z1);
+        if(xa>=xb||za>=zb)continue;
+        if(x0>=0&&x0<=16)emitTreeFace(TREE_LOD_UV,[[x0,y,zb],[x0,y,za],[x0,y1,za],[x0,y1,zb]],LIGHT.faces.x);
+        if(x1>=0&&x1<=16)emitTreeFace(TREE_LOD_UV,[[x1,y,zb],[x1,y,za],[x1,y1,za],[x1,y1,zb]],LIGHT.faces.x);
+        if(z0>=0&&z0<=16)emitTreeFace(TREE_LOD_UV,[[xb,y,z0],[xa,y,z0],[xa,y1,z0],[xb,y1,z0]],LIGHT.faces.z);
+        if(z1>=0&&z1<=16)emitTreeFace(TREE_LOD_UV,[[xa,y,z1],[xb,y,z1],[xb,y1,z1],[xa,y1,z1]],LIGHT.faces.z);
+        const next=levels[i+1];
+        if(!next){emitTreeTop(x0,x1,z0,z1,y1);continue}
+        const nx0=lx-next.rx,nx1=lx+next.rx+1,nz0=lz-next.rz,nz1=lz+next.rz+1;
+        // 上の帯が細くなる所だけ、葉の段差の上面を4枚のリングとして残す。
+        if(a.rx>next.rx){emitTreeTop(x0,nx0,z0,z1,y1);emitTreeTop(nx1,x1,z0,z1,y1)}
+        if(a.rz>next.rz){emitTreeTop(Math.max(x0,nx0),Math.min(x1,nx1),z0,nz0,y1);emitTreeTop(Math.max(x0,nx0),Math.min(x1,nx1),nz1,z1,y1)}
+      }
+    };
+    const emitTreeLod=()=>{
+      const x0=c.cx*16,z0=c.cz*16,mid=CFG.streaming.treeLodMidDist||24,far=CFG.streaming.lodFarDist||40;
+      for(const p of treeRecords(c)){
+        const info=treeInfo(p.n);if(!info||!treeAlive(p,info))continue;
+        const d=centerPos?Math.hypot(p.x/16-centerPos.cx,p.z/16-centerPos.cz):0;
+        const level=d>far?3:d>mid?2:1,lx=p.x-x0,lz=p.z-z0;
+        if(level===1){
+          const profile=p.n==='smallTree'?[{dy:0,h:1,rx:1,rz:1}]:[{dy:0,h:1,rx:1,rz:1},{dy:1,h:1,rx:2,rz:2},{dy:2,h:1,rx:2,rz:2},{dy:3,h:1,rx:1,rz:1}];
+          if(lx>=0&&lx<16&&lz>=0&&lz<16)emitTreeBox(info.trunk,lx,p.y,lz,1,info.trunkH,1,true,false);
+          emitTreeCanopy(lx,lz,p.y+info.trunkH,profile);
+        }else if(level===2){
+          const profile=p.n==='smallTree'?[{dy:0,h:1,rx:1,rz:1}]:[{dy:0,h:1,rx:1,rz:1},{dy:1,h:2,rx:2,rz:2},{dy:3,h:1,rx:1,rz:1}];
+          if(lx>=0&&lx<16&&lz>=0&&lz<16)emitTreeBox(info.trunk,lx,p.y,lz,1,info.trunkH,1,true,false);
+          emitTreeCanopy(lx,lz,p.y+info.trunkH,profile);
+        }else{
+          // 超遠景: 幹1本 + 不透明な葉の直方体1個。葉の穴や個々のブロックは描かない。
+          if(lx>=0&&lx<16&&lz>=0&&lz<16)emitTreeBox(info.trunk,lx,p.y,lz,1,info.trunkH,1,true,false);
+          const radius=p.n==='smallTree'?1:2,bh=p.n==='smallTree'?1:4,bw=radius*2+1,bd=bw;
+          const bx=lx-radius,by=p.y+info.trunkH,bz=lz-radius,bx1=bx+bw,by1=by+bh,bz1=bz+bd;
+          const xa=Math.max(0,bx),xb=Math.min(16,bx1),za=Math.max(0,bz),zb=Math.min(16,bz1);
+          if(xa<xb&&za<zb){
+            if(bx>=0&&bx<=16)emitTreeFace(TREE_LOD_UV,[[bx,by,zb],[bx,by,za],[bx,by1,za],[bx,by1,zb]],LIGHT.faces.x);
+            if(bx1>=0&&bx1<=16)emitTreeFace(TREE_LOD_UV,[[bx1,by,zb],[bx1,by,za],[bx1,by1,za],[bx1,by1,zb]],LIGHT.faces.x);
+            if(bz>=0&&bz<=16)emitTreeFace(TREE_LOD_UV,[[xb,by,bz],[xa,by,bz],[xa,by1,bz],[xb,by1,bz]],LIGHT.faces.z);
+            if(bz1>=0&&bz1<=16)emitTreeFace(TREE_LOD_UV,[[xa,by,bz1],[xb,by,bz1],[xb,by1,bz1],[xa,by1,bz1]],LIGHT.faces.z);
+            emitTreeTop(xa,xb,za,zb,by1);
+          }
+        }
+      }
+    };
+    for(let gz=0;gz<N;gz++)for(let gx=0;gx<N;gx++){
+      const i=gz*N+gx,y=gh[i],t=gt[i],lx=gx*step,lz=gz*step;if(y<0||!t)continue;
+      emitQuad(bufO,t,lx,y,lz,2,kbTop,1,step,step);
+      const chk=(dx,dz,fi,sLight)=>{
+        const nH=heightAt(gx+dx,gz+dz,y);
+        if(nH<y){
+          const kb=Math.round(255*LIGHT.lit*sLight),lim=nH;   // 壁は隣の高さまで全部下ろす(以前は16で打ち切られ崖に穴が空いた)
+          emitQuad(bufO,t,lx,lim+1,lz,fi,kb,y-lim,step,step);
+        }
+      };
+      chk(1,0,0,LIGHT.faces.x);chk(-1,0,1,LIGHT.faces.x);
+      chk(0,1,4,LIGHT.faces.z);chk(0,-1,5,LIGHT.faces.z);
+    }
+    emitTreeLod(); // 木は地形LODと独立した箱形状で描く
+    let L=null;
+    const P=[],C=[],U=[],I=[];let lv=0,a0=H,a1=0;
+    for(let gz=0;gz<N;gz++)for(let gx=0;gx<N;gx++){
+      const i=gz*N+gx,wy=gw[i],wt= gwt[i];if(wy<0||!wt)continue;
+      const lx=gx*step,lz=gz*step,sf=FLUIDH[wt]||.875,fu=FACE_UV[WATER],u=fu?fu.top:[0,0,1,1],kb=Math.round(255*LIGHT.lit*LIGHT.faces.top);
+      // 遠景LODでの周辺水色サンプル
+      let tr=0,tg=0,tb=0,tc=0;
+      for(let dz=-1;dz<=1;dz++) for(let dx=-1;dx<=1;dx++){
+        const bx=Math.max(0,Math.min(15,lx+dx)), bz=Math.max(0,Math.min(15,lz+dz));
+        const t=TINT[c.biome[(bz<<4)+bx]]||[1,1,1];
+        tr+=t[0]; tg+=t[1]; tb+=t[2]; tc++;
+      }
+      const tn=[tr/tc, tg/tc, tb/tc];
+      for(let j=0;j<4;j++){
+        const v=FACES[2].v[j];P.push(lx+v[0]*step,wy+sf,lz+v[2]*step);
+        C.push(kb*tn[0],kb*tn[1],kb*tn[2]);U.push(j===1||j===2?u[2]:u[0],j>=2?u[3]:u[1]);
+      }
+      I.push(lv,lv+1,lv+2,lv,lv+2,lv+3);lv+=4;if(wy<a0)a0=wy;if(wy+1>a1)a1=wy+1;
+    }
+    if(lv)L={nv:lv,P:new Float32Array(P),C:Uint8Array.from(C),U:new Float32Array(U),I:lv>65535?Uint32Array.from(I):Uint16Array.from(I),bs:[8,(a0+a1)/2,8,Math.hypot(8,8,(a1-a0)/2)]};
+    const K=packBuf(bufK),R=packBuf(bufO)||{nv:0};R.K=K;R.L=L;return R;
+  }
+  function pickLod(c,req){
+    if(req!==undefined)return c.lod=req;
+    if(c.lod!==undefined)return c.lod;
+    const d=centerPos?Math.hypot(c.cx-centerPos.cx,c.cz-centerPos.cz):0;
+    return c.lod=d>(CFG.streaming.lodFarDist||40)?2:d>CFG.streaming.lodDist?1:0;
+  }
+  function buildMesh(c,lod){
+    if(lod===1)return buildMeshFar(c,1);
+    if(lod>=2)return buildMeshFar(c,4);
+    const nb=[];for(let dz=-1;dz<=1;dz++)for(let dx=-1;dx<=1;dx++)nb.push(ensure(c.cx+dx,c.cz+dz));
+    const ni3=(lx,lz)=>(lz<0?0:lz>15?2:1)*3+(lx<0?0:lx>15?2:1);
+    const at=(lx,y,lz)=>{if(y<0)return BEDROCK_ID;if(y>=H)return 0;const n=nb[ni3(lx,lz)];return n?n.data[y*256+((lz&15)<<4)+(lx&15)]:0};
+    const lit=(lx,y,lz)=>{if(y<0||y>=H)return true;const n=nb[ni3(lx,lz)];return n?y>=n.light[((lz&15)<<4)+(lx&15)]:true};
+    let y0=c.lo; for(const i of [1,3,5,7])if(nb[i]&&nb[i].lo<y0)y0=nb[i].lo;
+    y0=Math.max(0,y0-1);
+    for(const B of [bufO,bufK]){if(!B.cap)growScratch(B,0);B.nv=0;B.ni=0;B.y0=H;B.y1=0}
+    const d=c.data,lq=[],ck=[];
+    // 草・葉・植物ブロックかを判定（豆ブロックは色変化から除外）
+    const isFoliage = id => id === ID.grass || id === ID.leaves;
+
+    // 周囲のバイオームの草木色をサンプルして平均化
+    const getSmoothFoliageTint = (lx, lz) => {
+      let r = 0, g = 0, b = 0, count = 0;
+      for (let dz = -2; dz <= 2; dz++) {
+        for (let dx = -2; dx <= 2; dx++) {
+          const nx = lx + dx, nz = lz + dz;
+          const n = nb[ni3(nx, nz)];
+          const bioId = (n && n.biome) ? n.biome[((nz & 15) << 4) + (nx & 15)] : c.biome[(lz << 4) + lx];
+          const t = FOLIAGE_TINT[bioId] || [1, 1, 1];
+          r += t[0]; g += t[1]; b += t[2]; count++;
+        }
+      }
+      return [r / count, g / count, b / count];
+    };
+
+    const emit=(B,t,lx,y,lz)=>{   // 1ブロック分の面を B に書き出す
+      const fu=FACE_UV[t];
+      const ft = isFoliage(t) ? getSmoothFoliageTint(lx, lz) : [1, 1, 1];
+      if(CROSS[t]){   // 十字形(植物): 斜め2枚の板。両面描画はマテリアル側
+        const u=fu.side,kb=Math.round(255*(lit(lx,y,lz)?LIGHT.lit:LIGHT.dark));
+        for(const q of [[[0,0,0],[1,0,1],[1,1,1],[0,1,0]],[[1,0,0],[0,0,1],[0,1,1],[1,1,0]]]){
+          if(B.nv+4>B.cap)growScratch(B,B.nv+4);
+          const P=B.P,C=B.C,U=B.U,I=B.I,nv=B.nv;let ni=B.ni;
+          for(let j=0;j<4;j++){
+            const v=q[j],o=(nv+j)*3;P[o]=lx+v[0];P[o+1]=y+v[1];P[o+2]=lz+v[2];
+            C[o]=Math.round(kb*ft[0]); C[o+1]=Math.round(kb*ft[1]); C[o+2]=Math.round(kb*ft[2]);
+            U[(nv+j)*2]=j===1||j===2?u[2]:u[0];U[(nv+j)*2+1]=j>=2?u[3]:u[1];
+          }
+          I[ni++]=nv;I[ni++]=nv+1;I[ni++]=nv+2;I[ni++]=nv;I[ni++]=nv+2;I[ni++]=nv+3;
+          I[ni++]=nv;I[ni++]=nv+2;I[ni++]=nv+1;I[ni++]=nv;I[ni++]=nv+3;I[ni++]=nv+2;   // 裏面用の逆回り
+          B.ni=ni;B.nv=nv+4;
+        }
+        if(y<B.y0)B.y0=y; if(y+1>B.y1)B.y1=y+1;
+        return;
+      }
+      for(const f of FACES){
+        const nx=lx+f.d[0],ny=y+f.d[1],nz=lz+f.d[2],nbk=at(nx,ny,nz);
+        if(OPAQUE[nbk]||(CULL[t]&&nbk===t))continue;   // 不透明に隠れる面 / cull:'same' で同じブロックに接する面は描かない
+        const kb=Math.round(Math.min(1,f.s*(lit(nx,ny,nz)?LIGHT.lit:LIGHT.dark))*255),u=fu[f.k];
+
+        // 草ブロック(grass)は上面(top)のみ着色し、側面・下面(土)は着色しない。葉や作物は全方向着色する。
+        const useTint = (t === ID.grass) ? (f.k === 'top') : isFoliage(t);
+        const tf = useTint ? ft : [1, 1, 1];
+
+        if(B.nv+4>B.cap)growScratch(B,B.nv+4);
+        const P=B.P,C=B.C,U=B.U,I=B.I,nv=B.nv;let ni=B.ni;
+        for(let j=0;j<4;j++){
+          const v=f.v[j],o=(nv+j)*3;
+          P[o]=lx+v[0];P[o+1]=y+v[1];P[o+2]=lz+v[2];
+          C[o]=Math.round(kb*tf[0]); C[o+1]=Math.round(kb*tf[1]); C[o+2]=Math.round(kb*tf[2]);
+          U[(nv+j)*2]=j===1||j===2?u[2]:u[0];U[(nv+j)*2+1]=j>=2?u[3]:u[1];
+        }
+        I[ni++]=nv;I[ni++]=nv+1;I[ni++]=nv+2;I[ni++]=nv;I[ni++]=nv+2;I[ni++]=nv+3;B.ni=ni;B.nv=nv+4;
+        if(y<B.y0)B.y0=y; if(y+1>B.y1)B.y1=y+1;
+
+        // 草ブロック側面の「草部分」オーバーレイ: 透明部分のあるタイルなので切り抜きメッシュ(bufK)へ、バイオーム色を掛けて重ねる
+        if(t===ID.grass && f.k==='side' && GRASS_SIDE_OVERLAY_UV){
+          const K=bufK,uo=GRASS_SIDE_OVERLAY_UV,EPS=0.004;   // 面と同一平面だとZファイトするので法線方向に僅かに浮かせる
+          if(K.nv+4>K.cap)growScratch(K,K.nv+4);
+          const PK=K.P,CK=K.C,UK=K.U,IK=K.I,nk=K.nv;let nik=K.ni;
+          for(let j=0;j<4;j++){
+            const v=f.v[j],o=(nk+j)*3;
+            PK[o]=lx+v[0]+f.d[0]*EPS;PK[o+1]=y+v[1];PK[o+2]=lz+v[2]+f.d[2]*EPS;
+            CK[o]=Math.min(255,Math.round(kb*ft[0]));CK[o+1]=Math.min(255,Math.round(kb*ft[1]));CK[o+2]=Math.min(255,Math.round(kb*ft[2]));
+            UK[(nk+j)*2]=j===1||j===2?uo[2]:uo[0];UK[(nk+j)*2+1]=j>=2?uo[3]:uo[1];
+          }
+          IK[nik++]=nk;IK[nik++]=nk+1;IK[nik++]=nk+2;IK[nik++]=nk;IK[nik++]=nk+2;IK[nik++]=nk+3;K.ni=nik;K.nv=nk+4;
+          if(y<K.y0)K.y0=y; if(y+1>K.y1)K.y1=y+1;
+        }
+      }
+    };
+    for(let y=y0;y<=c.hi;y++)for(let lz=0;lz<16;lz++)for(let lx=0;lx<16;lx++){
+      const t=d[y*256+lz*16+lx]; if(!t)continue;
+      if(TRANS[t]){lq.push(lx,y,lz,t);continue}   // 半透明(水など)は別メッシュ
+      if(CUT[t]){ck.push(lx,y,lz,t);continue}     // 切り抜き(葉・植物)も別メッシュ
+      emit(bufO,t,lx,y,lz);
+    }
+    for(let q=0;q<ck.length;q+=4)emit(bufK,ck[q+3],ck[q],ck[q+1],ck[q+2]);
+    let L=null;
+    // 水面の頂点の高さ: その頂点を囲む4セルの水位の平均(水源は重み10、空気は高さ0、固体は無視、上に流体があれば1)。隣のセルと同じ値になるので段差・隙間が出ない
+    const ch=(lx,y,lz,vx,vz,fl)=>{
+      let sum=0,w=0;
+      for(let a=vx-1;a<=vx;a++)for(let b=vz-1;b<=vz;b++){
+        if(FLUID[at(lx+a,y+1,lz+b)]===fl)return 1;
+        const n=at(lx+a,y,lz+b);
+        if(FLUID[n]===fl){const wt=FLUIDH[n]>.86?10:1;sum+=FLUIDH[n]*wt;w+=wt}
+        else if(!SOLID[n])w+=1;   // 固体(葉・ガラス含む)は壁、それ以外は空気として平均に入れる
+      }
+      return w?sum/w:FLUIDH[at(lx,y,lz)];
+    };
+    if(lq.length){   // 半透明: 同じ流体/不透明ブロックとの間の面は出さない。水面は FLUIDH の高さまで下げ、バイオームの水色を掛ける
+      const P=[],C=[],U=[],I=[];let lv=0,a0=H,a1=0;
+      // 周囲（5x5範囲）のバイオームの水色をサンプルして平均化し、色遷移を滑らかにする関数
+      const getSmoothTint = (lx, lz) => {
+        let r = 0, g = 0, b = 0, count = 0;
+        for (let dz = -2; dz <= 2; dz++) {
+          for (let dx = -2; dx <= 2; dx++) {
+            const nx = lx + dx, nz = lz + dz;
+            const n = nb[ni3(nx, nz)];
+            const bioId = (n && n.biome) ? n.biome[((nz & 15) << 4) + (nx & 15)] : c.biome[(lz << 4) + lx];
+            const t = TINT[bioId] || [1, 1, 1];
+            r += t[0]; g += t[1]; b += t[2]; count++;
+          }
+        }
+        return [r / count, g / count, b / count];
+      };
+      for(let q=0;q<lq.length;q+=4){
+        const lx=lq[q],y=lq[q+1],lz=lq[q+2],t=lq[q+3],fl=FLUID[t],fu=FACE_UV[t],tn=fl?getSmoothTint(lx,lz):[1,1,1];
+        const tp=!!fl&&FLUID[at(lx,y+1,lz)]!==fl;   // 水面(上に同じ流体が無い)
+        for(const f of FACES){
+          const nx=lx+f.d[0],ny=y+f.d[1],nz=lz+f.d[2],n=at(nx,ny,nz);
+          if(OPAQUE[n]||n===t||(fl&&FLUID[n]===fl))continue;
+          const kb=Math.min(1,f.s*(lit(nx,ny,nz)?LIGHT.lit:LIGHT.dark))*255,u=fu[f.k];
+          for(let j=0;j<4;j++){const v=f.v[j];P.push(lx+v[0],y+(v[1]?(tp?ch(lx,y,lz,v[0],v[2],fl):1):0),lz+v[2]);C.push(kb*tn[0],kb*tn[1],kb*tn[2]);U.push(j===1||j===2?u[2]:u[0],j>=2?u[3]:u[1])}
+          I.push(lv,lv+1,lv+2,lv,lv+2,lv+3);lv+=4;if(y<a0)a0=y;if(y+1>a1)a1=y+1;
+        }
+      }
+      if(lv)L={nv:lv,P:new Float32Array(P),C:Uint8Array.from(C),U:new Float32Array(U),I:lv>65535?Uint32Array.from(I):Uint16Array.from(I),bs:[8,(a0+a1)/2,8,Math.hypot(8,8,(a1-a0)/2)]};
+    }
+    const K=packBuf(bufK);
+    if(!bufO.nv&&!K&&!L)return {nv:0};
+    const R=packBuf(bufO)||{nv:0};R.K=K;R.L=L;return R;
+  }
+  const buffers=(mesh,data)=>{const t=data?[data.buffer]:[];if(mesh.nv)t.push(mesh.P.buffer,mesh.C.buffer,mesh.U.buffer,mesh.I.buffer);if(mesh.K)t.push(mesh.K.P.buffer,mesh.K.C.buffer,mesh.K.U.buffer,mesh.K.I.buffer);if(mesh.L)t.push(mesh.L.P.buffer,mesh.L.C.buffer,mesh.L.U.buffer,mesh.L.I.buffer);return t};
+
+  // ---------- ジョブ処理(1件ずつ処理し、間にメッセージを受け付ける → 編集が生成待ちに埋もれない) ----------
+  const mc=new MessageChannel();let busy=false,centerPos=null;
+  mc.port1.onmessage=run;
+  function kick(){if(!busy){busy=true;mc.port2.postMessage(0)}}
+  function run(){
+    const j=q0.length?q0.shift():q1.shift();
+    if(!j){busy=false;return}
+    try{exec(j)}catch(e){console.error('[chunk engine]',e);if(j.r)post({t:'fail',epoch:j.epoch,cx:j.cx,cz:j.cz})}
+    mc.port2.postMessage(0);
+  }
+  function exec(j){
+    if(j.epoch!==epoch)return;
+    if(j.r&&centerPos){
+      const dx=j.cx-centerPos.cx,dz=j.cz-centerPos.cz;
+      if(dx*dx+dz*dz>centerPos.r2)return; // 遠ざかったストリーミング要求は処理をスキップ
+    }
+    if(j.u)uq.delete(j.u);
+    if(j.k==='L'){                         // チャンク読み込み: 生成/復元 → メッシュ化 → データの複製とメッシュを返す
+      let c=chunks.get(j.cx,j.cz);
+      if(!(c&&j.lod&&!j.nd&&(c.data||c.fc)))c=ensure(j.cx,j.cz);   // 遠景で生データ不要なら、トリム済み(列データのみ)のままで足りる
+      if(!c){post({t:'fail',epoch:j.epoch,cx:j.cx,cz:j.cz});return}
+      const lod=pickLod(c,j.lod),mesh=buildMesh(c,lod),data=j.nd?c.data.slice():null;   // 生データを送るのは近景(メインが保持する範囲)だけ
+      post({t:'chunk',epoch:j.epoch,cx:j.cx,cz:j.cz,r:j.r,lod,data,lo:c.lo,hi:c.hi,gen:c.gen,modified:c.modified,structs:c.structs||[],biome:c.biome.slice(),mesh},buffers(mesh,data));
+      if(lod&&!j.nd)trim(c);
+    }else{                                  // メッシュのみ作り直し
+      let c=chunks.get(j.cx,j.cz);
+      const farOk=j.lod!==undefined?j.lod:(c?c.lod:0);
+      if(!c||!(c.data||(farOk&&c.fc))){if(j.r||c)c=ensure(j.cx,j.cz)}
+      if(!c){if(j.r)post({t:'fail',epoch:j.epoch,cx:j.cx,cz:j.cz});return}
+      const lod=pickLod(c,j.lod);
+      if(!lod&&!c.data)c=ensure(j.cx,j.cz);
+      const mesh=buildMesh(c,lod);
+      post({t:'mesh',epoch:j.epoch,cx:j.cx,cz:j.cz,r:j.r,lod,mesh},buffers(mesh));
+      if(lod)trim(c);
+    }
+  }
+  function urgent(cx,cz){
+    if(!chunks.get(cx,cz))return;
+    const u=cx+','+cz;if(uq.has(u))return;     // 同じチャンクの編集は1回の再メッシュにまとめる
+    uq.add(u);q0.push({k:'M',cx,cz,epoch,u,r:0});kick();
+  }
+  function edit(m){
+    if(m.epoch!==epoch||m.y<0||m.y>=H)return;
+    const cx=Math.floor(m.x/16),cz=Math.floor(m.z/16);let c=chunks.get(cx,cz); if(!c)return; if(!c.data)c=ensure(cx,cz);
+    const lx=m.x-cx*16,lz=m.z-cz*16;
+    c.data[m.y*256+lz*16+lx]=m.b;c.fc=null;if(!m.sim||c.modified)c.modified=true;
+    if(m.y<c.lo)c.lo=m.y; if(m.y>c.hi)c.hi=m.y;
+    calcLightColumn(c,lx,lz);
+    urgent(cx,cz);
+    if(lx===0)urgent(cx-1,cz); if(lx===15)urgent(cx+1,cz);
+    if(lz===0)urgent(cx,cz-1); if(lz===15)urgent(cx,cz+1);
+  }
+  function center(m){   // プレイヤーから遠い鏡を捨てる(メイン側の解放範囲より広く取るので、メインが持つチャンクは必ず鏡にもある)
+    const r2=m.r*m.r;
+    centerPos={cx:m.cx,cz:m.cz,r2};
+    const tr2=(CFG.streaming.lodDist+2)**2;   // LOD距離より十分遠いチャンクは列データだけにする(64チャンクで約1GB → 約25MB)
+    for(const c of chunks.values()){const dx=c.cx-m.cx,dz=c.cz-m.cz,dd=dx*dx+dz*dz;if(dd>r2)chunks.delete(c.cx,c.cz);else if(dd>tr2&&c.data)trim(c)}
+    last=null;
+    // 遠ざかったストリーミング要求はキューから破棄
+    for(let i=q1.length-1;i>=0;i--){
+      const j=q1[i];
+      if(j.r){
+        const dx=j.cx-m.cx,dz=j.cz-m.cz;
+        if(dx*dx+dz*dz>r2)q1.splice(i,1);
+      }
+    }
+  }
+  function handle(m){
+    switch(m.t){
+      case 'init':init(m);post({t:'ready'});break;
+      case 'tables':setTables(m.tables);break;
+      case 'world':   // ワールド切り替え(新規/読み込み): 鏡・待ち行列を全て破棄
+        epoch=m.epoch;SEED=m.seed;cc.clear();hasLegacy=m.hasLegacy;
+        store=new ChunkMap();for(const r of m.recs)store.set(r.cx,r.cz,r);
+        chunks=new ChunkMap();last=null;centerPos=null;q0.length=0;q1.length=0;uq.clear();break;
+      case 'store':store.set(m.rec.cx,m.rec.cz,m.rec);break;
+      case 'center':center(m);break;
+      case 'load':q1.push({k:'L',cx:m.cx,cz:m.cz,epoch:m.epoch,r:m.r,lod:m.lod,nd:m.nd});kick();break;
+      case 'mesh':q1.push({k:'M',cx:m.cx,cz:m.cz,epoch:m.epoch,r:m.r,lod:m.lod});kick();break;
+      case 'edit':edit(m);break;
+    }
+  }
+  return {handle};
+}
+
+// ---------- Meshing: メッシュはワーカーが作る。ここは受け取って scene に載せるだけ ----------
+const mat=new THREE.MeshBasicMaterial({map:atlas,vertexColors:true});   // 不透明: アルファテスト無し(先に描くので、切り抜きより前に深度が埋まる)
+const matCut=new THREE.MeshBasicMaterial({map:atlas,vertexColors:true,alphaTest:.5});   // 切り抜き(葉・植物)
+const scene=new THREE.Scene();
+scene.background=new THREE.Color(0x78A7FF);
+scene.fog=new THREE.Fog(0x78A7FF,24,48);
+const liquidMat=new THREE.MeshBasicMaterial({map:atlas,vertexColors:true,transparent:true,depthWrite:false});   // 半透明(水・ガラス): 透明度はテクスチャのアルファ
+// 水中: 画面の色付けとフォグを流体のデータ(camera)で切り替える
+const uwEl=document.createElement('div');uwEl.style.cssText='position:fixed;inset:0;pointer-events:none;display:none';document.body.appendChild(uwEl);
+const FOG0={c:new THREE.Color(0x78A7FF),n:24,f:48};let uwOn=0;
+function setUnder(id){
+  if(uwOn===id)return;uwOn=id;liquidMat.side=id?THREE.DoubleSide:THREE.FrontSide;
+  if(id){const c=FCAM[id];uwEl.style.background=c.tint;uwEl.style.display='block';scene.fog.color.set(c.fog.color);scene.background.set(c.fog.color);scene.fog.near=c.fog.near;scene.fog.far=c.fog.far}
+  else{uwEl.style.display='none';scene.fog.color.copy(FOG0.c);scene.background.copy(FOG0.c);scene.fog.near=FOG0.n;scene.fog.far=FOG0.f}
+}
+
+const origin={x:0,z:0},REBASE_AT=512;
+const blk=(a,l)=>origin[a]+Math.floor(l);   // ローカル座標→絶対ブロック座標。小数に巨大な原点を足さない(2^49で桁落ちするため)
+
+const LOD_DIST=CONFIG.streaming.lodDist,LOD_FAR_DIST=CONFIG.streaming.lodFarDist;
+// LOD0=通常メッシュ / LOD1=1ブロック列 / LOD2=4×4ブロック列。各境界に1チャンクのヒステリシス。
+function lodFor(cx,cz,cur){
+  const d=Math.hypot(cx-stream.cx,cz-stream.cz),raw=d>LOD_FAR_DIST?2:d>LOD_DIST?1:0;
+  if(cur===undefined)return raw;
+  if(cur===0)return d>LOD_DIST+1?raw:0;
+  if(cur===1)return d<LOD_DIST-1?0:d>LOD_FAR_DIST+1?2:1;
+  return d<LOD_FAR_DIST-1?(d<LOD_DIST-1?0:1):2;
+}
+const NEAR_DIST=14; // 半径14チャンク以内は生ボクセルを保持(当たり判定・MOB用)。メッシュの結合方式とは無関係
+const MESH_SINGLE_DIST=4; // 半径4チャンク以内だけ高応答な個別Mesh(編集の即時反映用)。これより外は結合リージョンへ(Draw Call削減)
+const REGION_NEAR_SHIFT=2,REGION_FAR_SHIFT=3; // リージョン一辺: NEAR_DIST以内は4x4チャンク、それより外は8x8チャンク
+const REGION_DEBOUNCE=200,REGION_MAXWAIT=800;  // 結合は「新しいチャンクが来なくなって200ms後」か「最初の変更から800ms後」まで待つ(読み込み中の再結合の連発を防ぐ)
+
+// kind: 'mesh'(不透明) / 'K'(切り抜き) / 'L'(半透明の水)
+// 遠景LOD(lod=1)のチャンクの水は不透明マテリアルに混ぜて描く(遠くでは半透明の見た目差が分からず、Draw Callとブレンド負荷が減る)
+function mergeChunkMeshes(chunkEntries, material, kind){
+  let totV=0,totI=0;
+  const list=[];
+  for(const entry of chunkEntries){
+    const m=entry.m;
+    if(kind==='mesh'){
+      if(m&&m.nv)list.push({part:m,offX:entry.cx*16-origin.x,offZ:entry.cz*16-origin.z});
+      if(entry.lod&&m&&m.L&&m.L.nv)list.push({part:m.L,offX:entry.cx*16-origin.x,offZ:entry.cz*16-origin.z});
+    }else{
+      const part=kind==='K'?m.K:(entry.lod?null:m.L);
+      if(part&&part.nv)list.push({part,offX:entry.cx*16-origin.x,offZ:entry.cz*16-origin.z});
+    }
+  }
+  for(const it of list){totV+=it.part.nv;totI+=it.part.I.length}
+  if(!totV)return null;
+  const P=new Float32Array(totV*3),C=new Uint8Array(totV*3),U=new Float32Array(totV*2);
+  const I=totV>65535?new Uint32Array(totI):new Uint16Array(totI);
+  let vOff=0,iOff=0;
+  for(const item of list){
+    const p=item.part,nv=p.nv,srcP=p.P,srcI=p.I,ox=item.offX,oz=item.offZ;
+    for(let i=0,n=nv*3;i<n;i+=3){const d=vOff*3+i;P[d]=srcP[i]+ox;P[d+1]=srcP[i+1];P[d+2]=srcP[i+2]+oz}
+    C.set(p.C.subarray(0,nv*3),vOff*3);   // 色とUVはそのままコピー(要素ごとのJSループをやめて memcpy 相当に)
+    U.set(p.U.subarray(0,nv*2),vOff*2);
+    for(let i=0,n=srcI.length;i<n;i++)I[iOff+i]=srcI[i]+vOff;
+    vOff+=nv;iOff+=srcI.length;
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(P,3));
+  g.setAttribute('color',new THREE.BufferAttribute(C,3,true));
+  g.setAttribute('uv',new THREE.BufferAttribute(U,2));
+  g.setIndex(new THREE.BufferAttribute(I,1));
+  g.computeBoundingSphere();
+  const o=new THREE.Mesh(g,material);
+  o.position.set(0,0,0);o.matrixAutoUpdate=false;o.updateMatrix();
+  scene.add(o);
+  return o;
+}
+
+class RegionBatcher {
+  constructor(){
+    this.regions=new Map();
+    this.pending=new Set();
+    this.urgentPending=new Set(); // チャンク削除後の古い合成メッシュを優先再構築
+    this.urgent=false;   // true の間の変更は待たずに即結合(ブロック編集の反映用)
+  }
+  hideRegion(r){
+    // 合成メッシュには削除済みチャンクの頂点も含まれるため、再構築まで表示を止める。
+    // これをしないと、チャンク管理上は消えていても古い遠景LODだけが残り続ける。
+    for(const k of ['mesh','kmesh','lmesh'])if(r[k])r[k].visible=false;
+  }
+  touch(r,immediate=false){
+    const now=performance.now();
+    if(!r.dirty){r.dirty=true;r.t0=now}
+    r.t1=now;if(this.urgent)r.t0=-1e9;
+    this.pending.add(r);
+    if(immediate){r.urgent=true;this.urgentPending.add(r)}
+  }
+  add(c,m){
+    const dx=c.cx-stream.cx,dz=c.cz-stream.cz;
+    const sh=(dx*dx+dz*dz<=NEAR_DIST*NEAR_DIST)?REGION_NEAR_SHIFT:REGION_FAR_SHIFT;
+    const rx=c.cx>>sh,rz=c.cz>>sh,k=sh+':'+rx+','+rz;
+    let r=this.regions.get(k);
+    if(!r){r={k,sh,rx,rz,chunks:new Map(),mesh:null,kmesh:null,lmesh:null,dirty:false,urgent:false,t0:0,t1:0};this.regions.set(k,r)}
+    r.chunks.set(c.cx+','+c.cz,{cx:c.cx,cz:c.cz,m,lod:c.lod|0});
+    c.rk=k;   // どのリージョンに入っているか(距離で一辺が変わるので記録しておく)
+    this.touch(r);
+  }
+  remove(c){
+    const r=c.rk?this.regions.get(c.rk):null;c.rk=null;
+    if(r&&r.chunks.delete(c.cx+','+c.cz)){
+      if(r.chunks.size===0){
+        this.disposeRegion(r);this.regions.delete(r.k);this.pending.delete(r);this.urgentPending.delete(r);
+      }else this.touch(r,true); // チャンク削除はデバウンスを待たず、次のflushで最優先更新
+    }
+  }
+  disposeRegion(r){
+    for(const k of ['mesh','kmesh','lmesh']){
+      if(r[k]){scene.remove(r[k]);r[k].geometry.dispose();r[k]=null}
+    }
+  }
+  flush(limit=2){
+    if(!this.pending.size)return;
+    const t0=performance.now();let count=0;
+    // 削除で古くなったリージョンを先に処理する。通常の新規チャンク結合は従来の待機時間を維持。
+    const todo=[...this.urgentPending,...this.pending];
+    for(const r of todo){
+      if(!this.pending.has(r))continue; // urgentPending と pending の重複を処理しない
+      if(!r.dirty){this.pending.delete(r);this.urgentPending.delete(r);r.urgent=false;continue}
+      const full=r.chunks.size>=(1<<(2*r.sh));
+      if(!r.urgent&&!(full||t0-r.t1>=REGION_DEBOUNCE||t0-r.t0>=REGION_MAXWAIT))continue;
+      this.disposeRegion(r);
+      if(r.chunks.size>0){
+        const entries=Array.from(r.chunks.values());
+        r.mesh=mergeChunkMeshes(entries,mat,'mesh');
+        r.kmesh=mergeChunkMeshes(entries,matCut,'K');
+        r.lmesh=mergeChunkMeshes(entries,liquidMat,'L');
+        if(r.lmesh)r.lmesh.renderOrder=1;
+      }else this.regions.delete(r.k);
+      r.dirty=false;r.urgent=false;this.pending.delete(r);this.urgentPending.delete(r);
+      if(++count>=limit||performance.now()-t0>6)break;   // 1フレームの結合は件数と時間で制限
+    }
+  }
+  clear(){
+    for(const r of this.regions.values())this.disposeRegion(r);
+    this.regions.clear();this.pending.clear();this.urgentPending.clear();
+  }
+}
+const regionBatcher=new RegionBatcher();
+
+function freeMesh(c){
+  for(const k of ['mesh','kmesh','lmesh'])if(c[k]){scene.remove(c[k]);c[k].geometry.dispose();c[k]=null}
+  if(regionBatcher)regionBatcher.remove(c);
+}
+function dropMesh(c){freeMesh(c);c.m=null;c.meshed=false;c.want=false}
+function mkMesh(c,m,material){   // ワーカーが作った型付き配列をそのまま GPU 用ジオメトリにする
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(m.P,3));
+  g.setAttribute('color',new THREE.BufferAttribute(m.C,3,true));
+  g.setAttribute('uv',new THREE.BufferAttribute(m.U,2));
+  g.setIndex(new THREE.BufferAttribute(m.I,1));
+  g.boundingSphere=new THREE.Sphere(new THREE.Vector3(m.bs[0],m.bs[1],m.bs[2]),m.bs[3]);
+  const o=new THREE.Mesh(g,material); o.position.set(c.cx*16-origin.x,0,c.cz*16-origin.z); o.matrixAutoUpdate=false; o.updateMatrix();
+  scene.add(o); return o;
+}
+function attachMesh(c,m){
+  freeMesh(c);
+  c.meshed=true;c.want=true;c.m=m;   // m を保持しておく(個別Mesh⇔リージョンの付け替えに使う。個別Meshの配列は three が元々保持しているので追加メモリはほぼ無い)
+  const dx=c.cx-stream.cx,dz=c.cz-stream.cz,d2=dx*dx+dz*dz;
+  if(d2<=MESH_SINGLE_DIST*MESH_SINGLE_DIST){
+    if(m.nv)c.mesh=mkMesh(c,m,mat);
+    if(m.K)c.kmesh=mkMesh(c,m.K,matCut);
+    if(m.L){c.lmesh=mkMesh(c,m.L,liquidMat);c.lmesh.renderOrder=1}
+  }else{
+    regionBatcher.add(c,m);
+  }
+}
+
+// ブロック変更: メインのデータは即座に書き換え(当たり判定・レイキャストはすぐ反映)、メッシュ更新はワーカーに任せる
+function setBlock(x,y,z,t,sim){   // sim: 成長などシミュレーション由来(編集済みチャンクでのみ保存対象)
+  if(y<0||y>=H)return;
+  const cx=Math.floor(x/16),cz=Math.floor(z/16),c=world.chunk(cx,cz); if(!c)return;
+  const lx=x-cx*16,lz=z-cz*16;
+  const old=c.data[y*256+lz*16+lx];c.data[y*256+lz*16+lx]=t;
+  if(!sim||c.modified){c.modified=true;c.dirty=true;editedSinceSave=true}
+  if(c.pl){const k=y*256+lz*16+lx;if(PLANT[t])c.pl.add(k);else c.pl.delete(k)}
+  if(y<c.lo)c.lo=y; if(y>c.hi)c.hi=y;
+  engine.send({t:'edit',epoch,x,y,z,b:t,sim:!!sim});
+  if(FK[t]||FK[old]||fluidNear(x,y,z))fluidWake(x,y,z);   // 流体が絡む変更だけ流れの更新キューへ   // ワーカーの鏡にも同じ変更を反映 → 隣接チャンク含め再メッシュ
+}
+
+// ---------- ワーカーとの接続 ----------
+// Worker が作れない環境(CSP などで禁止)では、同じエンジンをメインスレッドで動かす(MessageChannel で1件ずつ処理するので、重い生成も1フレームに固まらない)。
+let engine=null,epoch=0;
+const pending=new Map();   // 要求済みで未応答のチャンク("cx,cz" → 1)。同時に投げる数を maxInFlight に絞る
+const queued=new Set();   // 届いたが未反映(inbox 内)のチャンク: 重複要求の防止
+const inbox=[],inboxHi=[];            // ワーカーからの結果。フレームごとに予算内で反映する
+const GRASS_SIDE_OVERLAY_UV = uvOf('grass_side_overlay');
+const tablesNow=()=>({CUT:CUT.slice(),CROSS:CROSS.slice(),SOLID:SOLID.slice(),OPAQUE:OPAQUE.slice(),CULL:CULL.slice(),LIGHTBLOCK:LIGHTBLOCK.slice(),TRANS:TRANS.slice(),FLUID:FK.slice(),FLUIDH:FLUIDH.slice(),FACE_UV:Array.from(FACE_UV,u=>u||null),TREE_LOD_UV,GRASS_SIDE_OVERLAY_UV});
+const syncTables=()=>{if(engine)engine.send({t:'tables',tables:tablesNow()})};
+function startEngine(){
+  const initMsg={t:'init',config:CONFIG,genVersion:GEN_VERSION,ID,structs:STRUCT_LIST,wg:WORLDGEN,bio:BIO,tables:tablesNow()};
+  const inline=()=>{
+    const E=chunkEngine(onEngineMessage);E.handle(initMsg);
+    return {mode:'inline',send:m=>E.handle(m)};
+  };
+  return new Promise(res=>{
+    if(!CONFIG.streaming.useWorker||typeof Worker==='undefined'||typeof Blob==='undefined')return res(inline());
+    let done=false,w=null,url=null;
+    const fallback=why=>{if(done)return;done=true;clearTimeout(tm);try{w&&w.terminate()}catch(e){}console.warn('Worker を使えないためメインスレッドで動かします:',why);res(inline())};
+    const tm=setTimeout(()=>fallback('timeout'),3000);
+    try{
+      const src=[ChunkMap,rot,chunkEngine].map(f=>f.toString()).join('\n')+'\nconst E=chunkEngine((m,t)=>postMessage(m,t||[]));onmessage=e=>E.handle(e.data);';
+      url=URL.createObjectURL(new Blob([src],{type:'text/javascript'}));
+      w=new Worker(url);
+      w.onerror=e=>{if(e.preventDefault)e.preventDefault();if(!done)fallback(e.message||'error');else console.error('[chunk worker]',e.message||e)};
+      w.onmessage=e=>{
+        if(done||!e.data||e.data.t!=='ready')return;
+        done=true;clearTimeout(tm);URL.revokeObjectURL(url);
+        w.onmessage=ev=>onEngineMessage(ev.data);
+        res({mode:'worker',send:(m,tr)=>w.postMessage(m,tr||[])});
+      };
+      w.postMessage(initMsg);
+    }catch(e){fallback(e&&e.message||e)}
+  });
+}
+// ワールドの切り替え(起動/新規/読み込み): ワーカーに保存記録を渡し、鏡と待ち行列を作り直させる
+function resetWorld(){
+  epoch++;pending.clear();queued.clear();inbox.length=0;inboxHi.length=0;
+  if(typeof regionBatcher!=='undefined')regionBatcher.clear();
+  engine.send({t:'world',epoch,seed:SEED,hasLegacy:world.hasLegacy,recs:world.store.values()});
+}
+function onEngineMessage(m){
+  switch(m.t){
+    case 'chunk':case 'mesh':
+      if(m.epoch!==epoch)return;
+      if(m.r){const k=m.cx+','+m.cz;pending.delete(k);queued.add(k)}
+      if(m.t==='mesh'&&!m.r)inboxHi.push(m);else inbox.push(m);   // ブロック編集の再メッシュは読み込み待ちの列を追い越す
+      requestWanted();break;      // 空いた枠にすぐ次の要求を出す
+    case 'fail':
+      if(m.epoch===epoch){pending.delete(m.cx+','+m.cz);requestWanted()}break;
+  }
+}
+
+// ---------- Streaming: プレイヤー周辺の読み込み要求と不要チャンクの安全解放 ----------
+const stream={cx:NaN,cz:NaN,wanted:[],i:0,lastYaw:0};
+const inRange=(cx,cz,r)=>{const dx=cx-stream.cx,dz=cz-stream.cz;return dx*dx+dz*dz<=r*r};
+function rebuildWanted(pcx,pcz,R){
+  const yaw=typeof ctl!=='undefined'&&ctl?ctl.yaw:0;
+  const fx=-Math.sin(yaw),fz=-Math.cos(yaw);
+  const w=[];
+  for(let dz=-R;dz<=R;dz++)for(let dx=-R;dx<=R;dx++){
+    const d2=dx*dx+dz*dz;
+    if(d2<=R*R&&world.inBounds(pcx+dx,pcz+dz)){
+      // 視線方向（進行方向）の重み付け:
+      // 足元(d2===0)は最優先(0)。距離がある場合は正面(dot>0)なら優先度を上げ、背後(dot<0)なら下げる
+      const dot=d2>0?(dx*fx+dz*fz)/Math.sqrt(d2):0;
+      const pri=d2*(1 - 0.5*dot);
+      w.push([pri,pcx+dx,pcz+dz]);
+    }
+  }
+  return w.sort((a,b)=>a[0]-b[0]);
+}
+function requestWanted(){   // 近い順・視線優先に、maxInFlight 件までワーカーへ要求
+  if(!engine)return;
+  while(stream.i<stream.wanted.length&&pending.size<CONFIG.streaming.maxInFlight&&inbox.length<CONFIG.streaming.inboxMax){
+    const [,cx,cz]=stream.wanted[stream.i++],key=cx+','+cz;
+    if(pending.has(key)||queued.has(key))continue;
+    const c=world.chunks.get(cx,cz);
+    const needData = (cx-stream.cx)**2+(cz-stream.cz)**2 <= NEAR_DIST*NEAR_DIST;
+    if(!c){pending.set(key,1);engine.send({t:'load',epoch,cx,cz,r:1,lod:lodFor(cx,cz),nd:needData?1:0})}
+    else if(needData && (!c.data || !c.data.length)){pending.set(key,1);engine.send({t:'load',epoch,cx,cz,r:1,lod:lodFor(cx,cz),nd:1})}
+    else if(!c.want){c.want=true;pending.set(key,1);engine.send({t:'mesh',epoch,cx,cz,r:1,lod:lodFor(cx,cz)})}
+    else if(c.meshed){const l=lodFor(cx,cz,c.lod);if(l!==c.lod){pending.set(key,1);engine.send({t:'mesh',epoch,cx,cz,r:1,lod:l})}}   // 境界を越えたチャンクはLODを作り直す
+  }
+}
+function applyEdited(m){   // 編集由来の再メッシュ結果。待機中の古い結果は捨て、まだ未反映のチャンクなら待機中の結果に差し替える
+  const c=world.chunks.get(m.cx,m.cz);
+  for(let i=inbox.length-1;i>=0;i--){const q=inbox[i];if(q.cx!==m.cx||q.cz!==m.cz)continue;
+    if(q.t==='mesh'){inbox.splice(i,1);if(q.r)queued.delete(q.cx+','+q.cz)}
+    else if(!c){q.mesh=m.mesh;q.lod=m.lod}}
+  if(c&&inRange(m.cx,m.cz,CONFIG.streaming.renderDistance+1)){c.lod=m.lod|0;regionBatcher.urgent=true;try{attachMesh(c,m.mesh)}finally{regionBatcher.urgent=false}}   // 編集は結合待ちさせない
+}
+function integrate(budgetMs){   // ワーカーの結果を予算内で反映(ジオメトリ生成 + scene 追加だけなので軽い)
+  const S=CONFIG.streaming,R=S.renderDistance,keep=R+S.keepMargin,t0=performance.now();let nInt=0;
+  const tH=performance.now();
+  while(inboxHi.length){const m=inboxHi.shift();if(m.epoch===epoch)applyEdited(m);if(performance.now()-tH>6)break}
+  while(inbox.length){
+    const m=inbox.shift();
+    if(m.r)queued.delete(m.cx+','+m.cz);
+    let applied=false;   // 実際に反映した結果だけを1フレームの予算に数える(範囲外で捨てるだけの結果で枠を食わない)
+    if(m.epoch===epoch){
+      if(m.t==='chunk'){
+        if(inRange(m.cx,m.cz,keep)){   // 通り過ぎて遠くなった結果は捨てる
+          const dx=m.cx-stream.cx,dz=m.cz-stream.cz,d2=dx*dx+dz*dz;
+          const keepData=(d2<=NEAR_DIST*NEAR_DIST); // 近景のみ64KB生ボクセル配列を保持(遠景はメモリ解放)
+          if(keepData&&!m.data){stream.i=0;continue}   // 要求後に近づいて生データが要るのに届いていない: 読み直す
+          let c=world.chunks.get(m.cx,m.cz);
+          if(!c){
+            c=new Chunk(m.cx,m.cz,keepData?m.data:new Uint8Array(0));
+            c.lo=m.lo;c.hi=m.hi;c.gen=m.gen;c.modified=m.modified;c.structs=m.structs||[];c.biome=m.biome;c.shown=true;
+            world.chunks.set(m.cx,m.cz,c);
+          }else if(keepData&&m.data&&m.data.length){
+            c.data=m.data;
+          }
+          if(keepData)mobs.onChunk(c);
+          if(inRange(m.cx,m.cz,R+1)){c.lod=m.lod|0;attachMesh(c,m.mesh)}
+          applied=true;
+        }
+      }else{
+        const c=world.chunks.get(m.cx,m.cz);
+        if(c&&inRange(m.cx,m.cz,R+1)){c.lod=m.lod|0;attachMesh(c,m.mesh);applied=true}
+      }
+    }
+    if(applied&&(++nInt>=S.meshPerFrame||performance.now()-t0>=budgetMs))break;   // 時間に加えて件数でも制限(GPUアップロードの山を作らない)
+  }
+}
+function updateStreaming(pcx,pcz,budgetMs){
+  const S=CONFIG.streaming,R=S.renderDistance,keep=R+S.keepMargin;
+  const yaw=typeof ctl!=='undefined'&&ctl?ctl.yaw:0;
+  const posChanged=pcx!==stream.cx||pcz!==stream.cz;
+  const yawChanged=Math.abs(yaw-stream.lastYaw)>0.6; // 約35度以上回転
+  if(posChanged||(yawChanged&&stream.i<stream.wanted.length)){
+    if(posChanged){
+      stream.cx=pcx;stream.cz=pcz;
+      // ★ 遠ざかった pending（未完了要求）を即座に削除し、スロットを解放
+      for(const key of pending.keys()){
+        const idx=key.indexOf(',');
+        const cx=+key.slice(0,idx),cz=+key.slice(idx+1);
+        const dx=cx-pcx,dz=cz-pcz;
+        if(dx*dx+dz*dz>keep*keep)pending.delete(key);
+      }
+      // 遠ざかったチャンクのアンロード処理 & 接近したチャンクの近景昇格
+      for(const c of world.chunks.values()){
+        const dx=c.cx-pcx,dz=c.cz-pcz,d2=dx*dx+dz*dz;
+        if(d2>(R+1)*(R+1))dropMesh(c);
+        if(d2>keep*keep){
+          dropMesh(c);
+          // ★ 変更があったチャンクのみ永続化キューへ退避
+          if(c.modified&&c.dirty)persistChunk(c);
+          // メモリから完全に解放(GC対象)
+          world.chunks.delete(c.cx,c.cz);
+          if(world.last===c)world.last=null;
+        }else if(d2>(NEAR_DIST+2)*(NEAR_DIST+2)&&c.data&&c.data.length&&!c.modified){
+          c.data=new Uint8Array(0);c.pl=null;   // 近景から離れた未編集チャンクの生データを解放
+        }
+        // ※ 遠景から近景に入ったチャンクも既存メッシュを削除せず保持し、裏でデータと新メッシュを取得・差し替えます
+        if(c.meshed&&c.m&&d2<=(R+1)*(R+1)){   // 個別Mesh⇔リージョンの付け替え(昇格4チャンク以内 / 降格6チャンク超でヒステリシス)
+          if(c.rk&&d2<=MESH_SINGLE_DIST*MESH_SINGLE_DIST){regionBatcher.urgent=true;attachMesh(c,c.m);regionBatcher.urgent=false}
+          else if(!c.rk&&(c.mesh||c.kmesh||c.lmesh)&&d2>(MESH_SINGLE_DIST+2)*(MESH_SINGLE_DIST+2))attachMesh(c,c.m);
+        }
+      }
+      engine.send({t:'center',cx:pcx,cz:pcz,r:keep+2});   // ワーカーの鏡も、メインより少し広い範囲だけ残す
+    }
+    stream.lastYaw=yaw;stream.i=0;
+    stream.wanted=rebuildWanted(pcx,pcz,R);
+  }
+  integrate(budgetMs);
+  regionBatcher.flush(2); // 毎フレーム最大2リージョン(かつ約6ms以内)を結合更新(Draw Call削減)。待機中のリージョンは古いメッシュのまま表示
+  requestWanted();
+}
+
+// ---------- Persistence: 編集済み差分チャンクのみを保存 ----------
+const SCHEMA=2;
+function player1to2(p){
+  if(!p||typeof p!=='object'||!Number.isFinite(p.x)||!Number.isFinite(p.z))return p;
+  const ox=Math.floor(p.x/16)*16,oz=Math.floor(p.z/16)*16;
+  return {...p,ox,oz,x:p.x-ox,z:p.z-oz};
+}
+const MIGRATIONS={1:f=>({...f,schema:2,player:player1to2(f.player)})};
+const MAX_CHUNKS=2e6;
+let editedSinceSave=false;
+
+function pushRun(out,v,r){out.push(v);for(;r>127;r>>>=7)out.push((r&127)|128);out.push(r)}
+function encodeChunk(c){
+  const d=c.data,n=(c.hi+1)*256,out=[];let prev=d[0],run=0;
+  for(let i=0;i<n;i++){const v=d[i];if(v===prev)run++;else{pushRun(out,prev,run);prev=v;run=1}}
+  pushRun(out,prev,run);
+  return {cx:c.cx,cz:c.cz,gen:c.gen,hi:c.hi,lo:c.lo,b:Uint8Array.from(out)};
+}
+function checkRle(b,n,map){
+  let p=0,tot=0;
+  while(p<b.length){
+    const v=b[p];if(map[v]===undefined)return false;b[p++]=map[v];
+    let r=0,s=0,x;
+    do{if(p>=b.length||s>21)return false;x=b[p++];r+=(x&127)*2**s;s+=7}while(x&128);
+    if(r<1)return false;tot+=r;if(tot>n)return false;
+  }
+  return tot===n;
+}
+
+// 変更された(modified===true)チャンクのみを保存対象にする
+// 変更された(modified===true)チャンクのみを保存対象にする
+function persistChunk(c){
+  if(!c.modified)return;
+  const r=encodeChunk(c);
+  world.store.set(c.cx,c.cz,r);
+  world.changed.set(c.cx,c.cz,r);
+  c.dirty=false;
+  engine.send({t:'store',rec:r});   // ワーカーも保存記録を持つ(再読み込み時の復元・隣接チャンクのメッシュ用)
+}
+
+function flushDirty(){
+  let n=0;
+  for(const c of world.chunks.values()){
+    if(c.dirty&&c.modified){persistChunk(c);n++}
+  }
+  return n;
+}
+
+// ---------- Renderer / camera ----------
+// ---------- 描画設定(Esc メニューから変更 / localStorage に保存) ----------
+const GFX_DEF={mip:true,rd:8,sim:5,fog:true,fps:60,scale:100,auto:true,part:2,mobd:48,water:true,aa:false,dbg:1};
+const GFX_PRESET={
+  low:{rd:6,sim:4,fog:true,fps:60,scale:75,auto:true,part:1,mobd:32,water:false},
+  std:{rd:8,sim:5,fog:true,fps:60,scale:100,auto:true,part:2,mobd:48,water:true},
+  high:{rd:16,sim:8,fog:true,fps:60,scale:100,auto:true,part:2,mobd:64,water:true},
+  ultra:{rd:64,sim:8,fog:true,fps:60,scale:100,auto:true,part:2,mobd:64,water:true}};
+const GFX_KEY='watashi-gfx-v1',GFX=Object.assign({},GFX_DEF);
+try{Object.assign(GFX,JSON.parse(localStorage.getItem(GFX_KEY)||'{}'))}catch(e){}
+(function(){const c=(k,a,b)=>{const v=+GFX[k];GFX[k]=Number.isFinite(v)?Math.min(b,Math.max(a,v)):GFX_DEF[k]};
+  c('rd',2,64);c('sim',2,12);c('scale',50,200);c('mobd',16,64);c('part',0,2);c('dbg',0,2);
+  if(![0,30,60,120].includes(+GFX.fps))GFX.fps=60;GFX.fps=+GFX.fps;
+  for(const k of ['mip','fog','auto','water','aa'])GFX[k]=!!GFX[k]})();
+const gfxSave=()=>{try{localStorage.setItem(GFX_KEY,JSON.stringify(GFX))}catch(e){}};
+const RENDER=CONFIG.render;
+RENDER.antialias=GFX.aa;RENDER.pixelRatio=GFX.scale/100;RENDER.minPixelRatio=Math.min(.5,RENDER.pixelRatio);RENDER.adaptive=GFX.auto;RENDER.maxFps=GFX.fps||1e4;
+const renderer=new THREE.WebGLRenderer({antialias:RENDER.antialias,powerPreference:'high-performance'});
+let prCur=Math.min(devicePixelRatio,RENDER.pixelRatio);
+renderer.setPixelRatio(prCur);
+renderer.setSize(innerWidth,innerHeight);
+document.body.appendChild(renderer.domElement);
+const camera=new THREE.PerspectiveCamera(75,innerWidth/innerHeight,.1,120);
+addEventListener('resize',()=>{renderer.setSize(innerWidth,innerHeight);camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix()});
+// 描画距離 → 読み込み範囲・フォグ・遠クリップ面を一括で決める(以前は 4 / 24-48 / 120 が別々に固定されていた)
+let gfxScale=null;
+function applyGfx(){
+  const S=CONFIG.streaming,R=GFX.rd,end=Math.max(24,(R-1)*16);   // フォグ終端: 読み込み済み範囲の手前(端のチャンクのポップインを隠す)
+  if(S.renderDistance!==R){S.renderDistance=R;stream.cx=NaN}      // NaN にして読み込み対象を作り直させる
+  FOG0.n=GFX.fog?end*.5:1e5;FOG0.f=GFX.fog?end:1e5+1;             // フォグ OFF は距離を飛ばして実現(シェーダの再コンパイルを避ける)
+  camera.far=GFX.fog?end+32:(R+1)*24;camera.updateProjectionMatrix();
+  if(!uwOn){scene.fog.near=FOG0.n;scene.fog.far=FOG0.f}
+  RENDER.maxFps=GFX.fps||1e4;RENDER.adaptive=GFX.auto;RENDER.pixelRatio=GFX.scale/100;RENDER.minPixelRatio=Math.min(.5,RENDER.pixelRatio);
+  if(gfxScale!==GFX.scale){gfxScale=GFX.scale;prCur=Math.min(devicePixelRatio,RENDER.pixelRatio);renderer.setPixelRatio(prCur);renderer.setSize(innerWidth,innerHeight)}
+  const mf=GFX.mip?THREE.NearestMipmapLinearFilter:THREE.NearestFilter;
+  if(atlas.minFilter!==mf){atlas.minFilter=mf;atlas.needsUpdate=true}   // フィルタ変更はテクスチャの再アップロードで反映
+  const wo=GFX.water;   // 水の半透明 OFF: アルファテストで不透明に描く(水のアルファ .72 > .5)
+  if(liquidMat.transparent!==wo){liquidMat.transparent=wo;liquidMat.depthWrite=!wo;liquidMat.alphaTest=wo?0:.5;liquidMat.needsUpdate=true}
+}
+applyGfx();
+
+const hl=new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1.004,1.004,1.004)),new THREE.LineBasicMaterial({color:0x000000}));
+hl.visible=false; scene.add(hl);
+
+// ---------- Raycast (voxel DDA) ----------
+function raycast(ox,oz,o,d,max){
+  let x=Math.floor(o.x),y=Math.floor(o.y),z=Math.floor(o.z);
+  const sx=Math.sign(d.x),sy=Math.sign(d.y),sz=Math.sign(d.z);
+  const dx=sx?Math.abs(1/d.x):Infinity,dy=sy?Math.abs(1/d.y):Infinity,dz=sz?Math.abs(1/d.z):Infinity;
+  let mx=sx?(sx>0?x+1-o.x:o.x-x)*dx:Infinity,my=sy?(sy>0?y+1-o.y:o.y-y)*dy:Infinity,mz=sz?(sz>0?z+1-o.z:o.z-z)*dz:Infinity;
+  let t=0,nx=0,ny=0,nz=0;
+  while(t<=max){
+    if(y>=0&&TARG[get(ox+x,y,oz+z)])return{x:ox+x,y,z:oz+z,nx,ny,nz};
+    if(mx<my&&mx<mz){x+=sx;t=mx;mx+=dx;nx=-sx;ny=0;nz=0}
+    else if(my<mz){y+=sy;t=my;my+=dy;nx=0;ny=-sy;nz=0}
+    else{z+=sz;t=mz;mz+=dz;nx=0;ny=0;nz=-sz}
+  }
+  return null;
+}
+function rebase(ox,oz){
+  const dx=ox-origin.x,dz=oz-origin.z;if(!dx&&!dz)return;
+  
+  // 1. 個別メッシュ（近景）の移動
+  for(const c of world.chunks.values())for(const o of [c.mesh,c.kmesh,c.lmesh])if(o){o.position.x-=dx;o.position.z-=dz;o.updateMatrix()}
+
+  // 2.【追記部分】統合メッシュ（遠景/リージョン）の移動
+  for(const r of regionBatcher.regions.values()){
+    for(const o of [r.mesh,r.kmesh,r.lmesh]){
+      if(!o)continue;
+      o.position.x-=dx;
+      o.position.z-=dz;
+      o.updateMatrix();
+    }
+  }
+
+  // 3. MOBやプレイヤーの位置補正
+  mobs.shift(dx,dz);origin.x=ox;origin.z=oz;ctl.position.x-=dx;ctl.position.z-=dz;
+}
+
+
+// ---------- Particle System (ブロック崩れエフェクト) ----------
+class ParticleSystem{   // InstancedMesh 1個(draw call 1回)。粒ごとの Mesh/Material 生成をやめた
+  constructor(scene,max=2048){
+    this.scene=scene;this.max=max;this.p=[];
+    this.mesh=new THREE.InstancedMesh(new THREE.BoxGeometry(1,1,1),new THREE.MeshBasicMaterial({color:0xffffff}),max);
+    this.mesh.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+    this.mesh.instanceColor=new THREE.BufferAttribute(new Float32Array(max*3).fill(1),3);this.mesh.instanceColor.setUsage(THREE.DynamicDrawUsage);   // r128 の setColorAt は初回の count 分しか確保しない(以降の粒が黒になる)ので最大数で先に作る
+    this.mesh.frustumCulled=false;this.mesh.count=0;this.mesh.visible=false;
+    this.o=new THREE.Object3D();scene.add(this.mesh);
+  }
+  get particles(){return this.p}
+  spawn(wx,wy,wz,blockId,count=14){
+    if(!blockId||!GFX.part)return;
+    if(GFX.part===1)count=Math.ceil(count/3);
+    const base=getBlockColor(blockId),sx=wx+0.5-origin.x,sy=wy+0.5,sz=wz+0.5-origin.z,r=Math.random;
+    for(let i=0;i<count&&this.p.length<this.max;i++){
+      const life=0.5+r()*0.5;
+      this.p.push({x:sx+(r()-.5)*.7,y:sy+(r()-.5)*.7,z:sz+(r()-.5)*.7,vx:(r()-.5)*5,vy:r()*4+1.5,vz:(r()-.5)*5,
+        wx:(r()-.5)*12,wy:(r()-.5)*12,wz:(r()-.5)*12,ax:0,ay:0,az:0,life,max:life,size:.06+r()*.07,
+        col:base.clone().offsetHSL(0,0,(r()-.5)*.18)});
+    }
+  }
+  update(dt){
+    const p=this.p,mesh=this.mesh,o=this.o;
+    for(let i=p.length-1;i>=0;i--){
+      const d=p[i];d.life-=dt;
+      if(d.life<=0){p[i]=p[p.length-1];p.pop();continue}
+      d.vy-=22*dt;d.x+=d.vx*dt;d.y+=d.vy*dt;d.z+=d.vz*dt;
+      d.ax+=d.wx*dt;d.ay+=d.wy*dt;d.az+=d.wz*dt;
+      if(d.vy<0&&solid(blk('x',d.x),Math.floor(d.y-0.08),blk('z',d.z))){d.y=Math.ceil(d.y)+0.02;d.vy*=-0.35;d.vx*=0.7;d.vz*=0.7}
+    }
+    const L=p.length;mesh.count=L;mesh.visible=L>0;if(!L)return;
+    for(let i=0;i<L;i++){const d=p[i];
+      o.position.set(d.x,d.y,d.z);o.rotation.set(d.ax,d.ay,d.az);o.scale.setScalar(Math.max(0.01,d.life/d.max*d.size));o.updateMatrix();
+      mesh.setMatrixAt(i,o.matrix);mesh.setColorAt(i,d.col);
+    }
+    mesh.instanceMatrix.needsUpdate=true;if(mesh.instanceColor)mesh.instanceColor.needsUpdate=true;
+  }
+}
+const particles=new ParticleSystem(scene);
+
+// ---------- FPS Controller ----------
+const moveToward=(a,b,d)=>a<b?Math.min(a+d,b):Math.max(a-d,b);
+class FPSController{
+  constructor(camera){
+    this.camera=camera;
+    this.position=new THREE.Vector3();
+    this.velocity=new THREE.Vector3();
+    this.direction=new THREE.Vector3();
+    this.front=new THREE.Vector3();
+    this.right=new THREE.Vector3();
+    this.keys={};
+    this.yaw=0;this.pitch=0;
+    Object.assign(this,CONFIG.player);
+    this.grounded=false;this.locked=false;
+    this.eHeld=false;this.eUp=-1e9;this.releasing=false;   // Eキーの押下状態 / 自分でポインタロックを解除中か
+    this.hotbar=Array.from({length:CONFIG.hotbarSize},(_,i)=>ID[CONFIG.hotbar[i]]||0);
+    this.slot=CONFIG.startSlot;
+    this.init();
+  }
+  get block(){return this.hotbar[this.slot]}
+  chunkX(){return origin.x/16+Math.floor(this.position.x/16)}
+  chunkZ(){return origin.z/16+Math.floor(this.position.z/16)}
+  select(n){this.slot=n;this.inventory.render()}
+  requestLock(){try{const p=renderer.domElement.requestPointerLock();if(p&&p.catch)p.catch(()=>{})}catch(e){}}
+  releaseLock(){if(document.pointerLockElement){this.releasing=true;document.exitPointerLock()}}   // 自分で解除したことを覚えておく(pointerlockchange で一時停止と誤認しないため)
+  init(){
+    const el=renderer.domElement;
+    addEventListener("keydown",e=>{
+      if(this.pause&&this.pause.open){
+        if(e.code==="Escape"&&performance.now()-this.pause.shownAt>300)this.pause.esc();
+        return;
+      }
+      if(e.code==="KeyE"){
+        // キーリピート対策: repeat が false で届く環境(keyup→keydown が連続で来る)でも、
+        // 押しっぱなし中・離した直後(40ms未満)の keydown は無視して1回の押下=1回の開閉にする
+        const dup=e.repeat||this.eHeld||e.timeStamp-this.eUp<40;
+        this.eHeld=true;
+        if(!dup)this.inventory.toggle();
+        return;
+      }
+      if(this.inventory.open){
+        if(e.code==="Escape")this.inventory.close();
+        else if(e.code.startsWith("Digit"))this.inventory.assignHovered(+e.code.slice(5)-1);
+        return;
+      }
+      this.keys[e.code]=true;
+      if(e.code==="Space")e.preventDefault();   // フォーカス中のボタンをスペースで誤作動させない
+      if(e.code==="Space"&&this.grounded&&!this.swim)this.velocity.y=this.jumpPower;   // 水中では通常ジャンプしない
+      if(e.code.startsWith("Digit")){const n=+e.code.slice(5)-1;if(n>=0&&n<this.hotbar.length)this.select(n)}
+    });
+    addEventListener("keyup",e=>{if(e.code==="KeyE"){this.eHeld=false;this.eUp=e.timeStamp}this.keys[e.code]=false});
+    addEventListener("blur",()=>{this.keys={};this.eHeld=false});   // ウィンドウを離れたときキーが押しっぱなしにならない
+    addEventListener("mousemove",e=>{
+      if(!this.locked)return;
+      this.yaw-=e.movementX*this.mouseSensitivity;
+      this.pitch-=e.movementY*this.mouseSensitivity;
+      this.pitch=Math.max(-Math.PI/2+.05,Math.min(Math.PI/2-.05,this.pitch));
+    });
+    addEventListener("wheel",e=>{if(this.inventory.open||(this.pause&&this.pause.open))return;const n=this.hotbar.length;this.select((this.slot+Math.sign(e.deltaY)+n)%n)});
+    addEventListener("contextmenu",e=>e.preventDefault());
+    document.addEventListener("pointerlockchange",()=>{
+      this.locked=document.pointerLockElement===el;
+      if(this.locked){this.releasing=false;if(this.pause)this.pause.hide(true);return}
+      const mine=this.releasing;this.releasing=false;
+      if(this.inventory.open||(this.pause&&this.pause.open))return;
+      if(mine)this.requestLock();   // インベントリを開いてすぐ閉じた: 解除が遅れて届いただけなので取り直す(一時停止にしない)
+      else if(this.pause)this.pause.show();
+    });
+    document.addEventListener("pointerlockerror",()=>{
+      this.releasing=false;
+      if(!this.inventory.open&&!(this.pause&&this.pause.open))toast('画面をクリックして操作を再開');
+    });
+    el.addEventListener("mousedown",e=>{
+      if(this.inventory.open||(this.pause&&this.pause.open))return;
+      if(!this.locked){this.requestLock();return}
+      this.action(e.button);
+    });
+  }
+  look(){
+    const c=Math.cos(this.pitch);
+    return new THREE.Vector3(-Math.sin(this.yaw)*c,Math.sin(this.pitch),-Math.cos(this.yaw)*c);
+  }
+  target(){return raycast(origin.x,origin.z,this.position,this.look(),this.reach)}
+  bd(h){return Math.hypot((h.x-origin.x)+.5-this.position.x,h.y+.5-this.position.y,(h.z-origin.z)+.5-this.position.z)-.5}
+  action(button){
+    const h=this.target(),e=mobs.aim(this);
+    if(e&&(!h||e.d<this.bd(h))){mobs.interact(e.m,button,this);return}
+    if(!h)return;
+    const t=get(h.x,h.y,h.z);
+    if(button===0){
+      if(h.y>0){setBlock(h.x,h.y,h.z,0);particles.spawn(h.x,h.y,h.z,isBean(t)?ID.leaves:t,14);
+        if(isBean(t))giveBean();
+        else if(isBean(get(h.x,h.y+1,h.z))){setBlock(h.x,h.y+1,h.z,0);giveBean()}}   // 土台を壊すと豆も外れる
+    }
+    else if(button!==2)return;   // 中ボタン等では設置・収穫しない
+    else if(isBean(t)){const p=PLANT[t];if(p.to&&giveBean(p.give))setBlock(h.x,h.y,h.z,p.to)}   // 収穫: 若葉に戻る
+    else if(this.block>=1000){   // 豆を植える
+      const it=ITEM_BY_ID[this.block];if(h.ny===1&&it&&it.plants&&it.on.some(n=>ID[n]===t)&&!get(h.x,h.y+1,h.z)){setBlock(h.x,h.y+1,h.z,ID[it.plants]);this.hotbar[this.slot]=0;this.inventory.render()}
+    }
+    else{
+      if(!this.block)return;
+      const bx=h.x+h.nx,by=h.y+h.ny,bz=h.z+h.nz;
+      if(by<0||by>=H||!world.inBounds(Math.floor(bx/16),Math.floor(bz/16))||!REPL[get(bx,by,bz)])return;
+      const r=this.radius,feet=this.position.y-this.eyeHeight,lx=bx-origin.x,lz=bz-origin.z;
+      const ov=lx<this.position.x+r&&lx+1>this.position.x-r&&by<feet+this.height&&by+1>feet&&lz<this.position.z+r&&lz+1>this.position.z-r;
+      if(!ov)setBlock(bx,by,bz,this.block);
+    }
+  }
+  hit(){
+    const p=this.position,r=this.radius,feet=p.y-this.eyeHeight,ox=origin.x,oz=origin.z;
+    const x0=Math.floor(p.x-r),x1=Math.floor(p.x+r),y0=Math.floor(feet),y1=Math.floor(feet+this.height),z0=Math.floor(p.z-r),z1=Math.floor(p.z+r);
+    for(let y=y0;y<=y1;y++)for(let z=z0;z<=z1;z++)for(let x=x0;x<=x1;x++)if(solid(ox+x,y,oz+z))return true;
+    return false;
+  }
+  moveAxis(axis,amount){
+    if(!amount)return;
+    this.position[axis]+=amount;
+    if(!this.hit())return;
+    if(axis!=="y")this.bump=true;
+    this.position[axis]-=amount;
+    if(axis==="y"&&amount<0)this.grounded=true;
+    this.velocity[axis]=0;
+  }
+  phys(){   // 腰の高さが流体なら泳ぎ状態(物理データを返す)。目が水中かも更新
+    const p=this.position,x=blk('x',p.x),z=blk('z',p.z),id=get(x,Math.floor(p.y-this.eyeHeight+.5),z),ey=Math.floor(p.y),ei=get(x,ey,z);
+    this.eyeIn=!!FK[ei]&&(p.y-ey<FLUIDH[ei]||!!FK[get(x,ey+1,z)]);this.eyeId=this.eyeIn?ei:0;
+    const ph=FK[id]?FPHYS[id]:null;this.swim=!!ph;return ph;
+  }
+  step(dt){
+    this.front.set(-Math.sin(this.yaw),0,-Math.cos(this.yaw));
+    this.right.set(Math.cos(this.yaw),0,-Math.sin(this.yaw));
+    this.direction.set(0,0,0);
+    if(this.keys.KeyW)this.direction.add(this.front);
+    if(this.keys.KeyS)this.direction.sub(this.front);
+    if(this.keys.KeyD)this.direction.add(this.right);
+    if(this.keys.KeyA)this.direction.sub(this.right);
+    if(this.direction.lengthSq())this.direction.normalize();
+    const bumped=this.bump;this.bump=false;
+    const ph=this.phys(),sp=this.speed*(this.keys.ShiftLeft?this.sprint:1)*(ph?ph.speed:1),am=ph?ph.accel:1;
+    const tx=this.direction.x*sp,tz=this.direction.z*sp;
+    if(this.direction.lengthSq()){
+      const acc=(this.grounded?this.acceleration:this.airAcceleration)*dt*am;
+      this.velocity.x=moveToward(this.velocity.x,tx,acc);
+      this.velocity.z=moveToward(this.velocity.z,tz,acc);
+    }else{
+      const f=(this.grounded?this.friction:this.airAcceleration*.5)*dt;
+      this.velocity.x=moveToward(this.velocity.x,0,f);
+      this.velocity.z=moveToward(this.velocity.z,0,f);
+    }
+    if(ph){   // 水中: 弱い重力・抵抗。スペースで浮上、水面ではジャンプで岸へ上がれる
+      const v=this.velocity;
+      if(this.keys.Space){
+        v.y=moveToward(v.y,this.eyeIn?ph.swimUp:0,30*dt);   // 水面ではその場に浮くだけ(跳び上がらない)
+        if(bumped&&this.direction.lengthSq())v.y=Math.max(v.y,ph.climb);   // 壁に向かって進みながらスペースで岸に上がる
+      }
+      v.y=Math.max(v.y-ph.gravity*dt,-ph.fall)*Math.exp(-ph.drag*dt);
+    }else this.velocity.y=Math.max(this.velocity.y-this.gravity*dt,-40);
+    this.moveAxis("x",this.velocity.x*dt);
+    this.moveAxis("z",this.velocity.z*dt);
+    this.grounded=false;
+    this.moveAxis("y",this.velocity.y*dt);
+    if(this.position.y<-20){this.position.y=H+this.eyeHeight;this.velocity.set(0,0,0)}
+  }
+  update(dt,frozen){
+    if(frozen)this.velocity.set(0,0,0);   // 足元のチャンクが届くまで物理を止める(視点操作は有効)
+    else{
+      const n=Math.max(1,Math.ceil(dt/.01));
+      for(let i=0;i<n;i++)this.step(Math.max(dt,0)/n);
+      if(Math.abs(this.position.x)>REBASE_AT||Math.abs(this.position.z)>REBASE_AT)
+        rebase(origin.x+Math.floor(this.position.x/16)*16,origin.z+Math.floor(this.position.z/16)*16);
+    }
+    setUnder(this.eyeId||0);
+    this.camera.position.copy(this.position);
+    this.camera.rotation.set(this.pitch,this.yaw,0,"YXZ");
+  }
+}
+
+// ---------- Inventory / Hotbar UI ----------
+class InventoryUI{
+  constructor(ctl){
+    this.ctl=ctl;this.open=false;this.picked=0;this.hover=0;
+    this.swatch=id=>`url(${TEX_URL[id>=1000?'bean_item':FACE_TEX[id].side]}) center/100% 100% no-repeat`;
+    this.names={1000:'bean'};for(const [n,b] of Object.entries(BLOCKS))this.names[b.id]=n;
+    const st=document.createElement('style');
+    st.textContent=`
+.hb{position:fixed;left:50%;bottom:calc(14px + env(safe-area-inset-bottom,0px));transform:translateX(-50%);display:flex;gap:4px;padding:4px;background:rgba(0,0,0,.45);border-radius:6px;pointer-events:none;z-index:3;user-select:none;font:11px sans-serif;color:#fff}
+.hb.act{pointer-events:auto}
+.sl{position:relative;width:44px;height:44px;box-sizing:border-box;border:2px solid rgba(255,255,255,.25);border-radius:4px}
+.hb.act .sl{cursor:pointer}
+.sl.on{border-color:#fff;box-shadow:0 0 0 2px rgba(0,0,0,.6)}
+.sl i{position:absolute;left:3px;top:0;font-style:normal;opacity:.85;z-index:1}
+.sw{position:absolute;inset:5px;border-radius:2px;image-rendering:pixelated}
+.inv{position:fixed;inset:0;display:none;align-items:center;justify-content:center;background:rgba(0,0,0,.5);z-index:2;font:12px sans-serif;color:#fff;user-select:none}
+.pn{width:min(520px,90vw);padding:14px;border-radius:8px;background:rgba(30,30,34,.96)}
+.gr{display:grid;grid-template-columns:repeat(auto-fill,64px);gap:6px;max-height:50vh;overflow:auto;margin-top:10px}
+.tl{position:relative;height:64px;box-sizing:border-box;border:2px solid transparent;border-radius:4px;background:rgba(255,255,255,.06);cursor:pointer}
+.tl:hover{background:rgba(255,255,255,.14)}
+.tl.pk{border-color:#fff}
+.tl .sw{inset:auto;top:5px;left:50%;width:40px;height:40px;margin-left:-20px}
+.tl span{position:absolute;left:0;right:0;bottom:3px;text-align:center;font-size:10px}`;
+    document.head.appendChild(st);
+
+    this.bar=document.createElement('div');this.bar.className='hb';
+    this.slots=ctl.hotbar.map((_,i)=>{
+      const el=document.createElement('div');el.className='sl';
+      el.innerHTML=`<i>${i+1}</i><div class="sw"></div>`;
+      el.addEventListener('click',()=>{
+        if(!this.open)return;
+        if(this.picked&&ctl.hotbar[i]<1000){ctl.hotbar[i]=this.picked;this.picked=0}
+        ctl.slot=i;this.render();
+      });
+      el.addEventListener('contextmenu',e=>{e.preventDefault();if(this.open){ctl.hotbar[i]=0;this.render()}});
+      this.bar.appendChild(el);return el;
+    });
+    document.body.appendChild(this.bar);
+
+    this.root=document.createElement('div');this.root.className='inv';
+    this.root.innerHTML='<div class="pn"><div>インベントリ</div><div class="gr"></div></div>';
+    const grid=this.root.querySelector('.gr');
+    this.tiles={};
+    for(const [name,b] of Object.entries(BLOCKS)){
+      if(!b.placeable)continue;
+      const el=document.createElement('div');el.className='tl';el.title=name;
+      el.innerHTML=`<div class="sw" style="background:${this.swatch(b.id)}"></div><span>${name}</span>`;
+      el.addEventListener('click',()=>{this.picked=this.picked===b.id?0:b.id;this.render()});
+      el.addEventListener('mouseenter',()=>this.hover=b.id);
+      el.addEventListener('mouseleave',()=>this.hover=0);
+      grid.appendChild(el);this.tiles[b.id]=el;
+    }
+    document.body.appendChild(this.root);
+    this.render();
+  }
+  render(){
+    this.slots.forEach((el,i)=>{
+      const id=this.ctl.hotbar[i];
+      el.classList.toggle('on',i===this.ctl.slot);
+      el.title=id?this.names[id]:'';
+      el.lastChild.style.background=id?this.swatch(id):'';
+    });
+    for(const id in this.tiles)this.tiles[id].classList.toggle('pk',+id===this.picked);
+  }
+  assignHovered(n){
+    if(!this.hover||n<0||n>=this.ctl.hotbar.length||this.ctl.hotbar[n]>=1000)return;
+    this.ctl.hotbar[n]=this.hover;this.ctl.slot=n;this.render();
+  }
+  toggle(){this.open?this.close():this.show()}
+  show(){
+    this.open=true;this.ctl.keys={};
+    this.root.style.display='flex';this.bar.classList.add('act');
+    this.ctl.releaseLock();
+  }
+  close(){
+    this.open=false;this.picked=0;this.hover=0;this.render();
+    this.root.style.display='none';this.bar.classList.remove('act');
+    this.ctl.requestLock();
+  }
+}
+const ctl=new FPSController(camera);
+ctl.inventory=new InventoryUI(ctl);
+
+// ================= MOB(鳩・村人)・豆の成長 =================
+const mobMat=new THREE.MeshBasicMaterial({map:atlas,vertexColors:true,alphaTest:.5});
+const FACES6=['right','left','top','bottom','back','front'],SH6=[.6,.6,1,.5,.8,.8];
+function buildMob(def,vr){   // MOBS の定義 → three.js のパーツ階層
+  const parts={...def.parts};for(const k in (vr&&vr.parts)||{})parts[k]={...parts[k],...vr.parts[k]};
+  const g={},root=new THREE.Group();
+  const mk=k=>{
+    if(g[k])return g[k];
+    const p=parts[k],o=new THREE.Group(),[w,h,d]=p.size.map(v=>v/16),geo=new THREE.BoxGeometry(w,h,d),t=p.tex||{all:p.color},uv=geo.attributes.uv,col=[];
+    FACES6.forEach((f,i)=>{const u=uvOf(t[f]||(i<2||i>3?t.side:0)||t.all);
+      [[u[0],u[3]],[u[2],u[3]],[u[0],u[1]],[u[2],u[1]]].forEach((c,j)=>{uv.setXY(i*4+j,c[0],c[1]);col.push(SH6[i],SH6[i],SH6[i])})});
+    geo.setAttribute('color',new THREE.Float32BufferAttribute(col,3));
+    if(p.off)geo.translate(p.off[0]/16,p.off[1]/16,p.off[2]/16);
+    o.add(new THREE.Mesh(geo,mobMat));o.position.set(...(p.at||[0,0,0]).map(v=>v/16));g[k]=o;
+    (p.parent?mk(p.parent):root).add(o);return o;
+  };
+  for(const k in parts)mk(k);
+  return {root,g};
+}
+const isBean=t=>!!PLANT[t];
+const toastEl=document.createElement('div');
+toastEl.style.cssText='position:fixed;left:50%;bottom:80px;transform:translateX(-50%);padding:6px 12px;background:rgba(0,0,0,.6);color:#fff;font:14px sans-serif;border-radius:6px;pointer-events:none;opacity:0;transition:opacity .3s;z-index:3';
+document.body.appendChild(toastEl);let toastT;
+function toast(s){toastEl.textContent=s;toastEl.style.opacity=1;clearTimeout(toastT);toastT=setTimeout(()=>toastEl.style.opacity=0,2500)}
+function giveBean(n='bean'){const i=ctl.hotbar.indexOf(0);if(i<0){toast('ホットバーがいっぱいです');return false}ctl.hotbar[i]=ID[n];ctl.inventory.render();return true}
+const wrap=a=>((a+Math.PI)%(2*Math.PI)+2*Math.PI)%(2*Math.PI)-Math.PI,clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const turn=(m,to,dt,r)=>{m.yaw+=clamp(wrap(to-m.yaw),-r*dt,r*dt)},faceTo=(m,x,z)=>Math.atan2(-(x-m.x),-(z-m.z));
+function boxHit(m,x,y,z){const r=m.r,ox=origin.x,oz=origin.z;
+  for(let Y=Math.floor(y);Y<=Math.floor(y+m.h);Y++)for(let Z=Math.floor(z-r);Z<=Math.floor(z+r);Z++)for(let X=Math.floor(x-r);X<=Math.floor(x+r);X++)if(solid(ox+X,Y,oz+Z))return true;
+  return false}
+function phys(m,dt,vx,vz){   // 重力 + 軸ごとの衝突 + 1ブロックの段差登り
+  {const wet=FK[get(blk('x',m.x),Math.floor(m.y+.4),blk('z',m.z))];m.vy=wet?Math.max(-2,Math.min(2,m.vy+12*dt)):Math.max(m.vy-22*dt,-30)}   // 水中は浮く
+  for(const ax of [0,1]){const nx=m.x+(ax?0:vx*dt),nz=m.z+(ax?vz*dt:0);
+    if(!boxHit(m,nx,m.y,nz)){m.x=nx;m.z=nz}else if(m.on&&!boxHit(m,nx,m.y+1.01,nz)){m.y+=1.01;m.x=nx;m.z=nz}else m.bump=1}
+  const ny=m.y+m.vy*dt;
+  if(boxHit(m,m.x,ny,m.z)){if(m.vy<0)m.y=Math.floor(ny)+1.001;m.vy=0}else m.y=ny;
+  m.on=boxHit(m,m.x,m.y-.05,m.z)?1:0;   // 接地は足元を探って判定(フレームレートで揺らがない)
+}
+function pose(m,s,t){
+  const A=m.def.anim||{};for(const o of Object.values(m.g))o.rotation.set(0,0,0);
+  for(const k of ['base',s])for(const [n,r] of Object.entries(A[k]||{})){const o=m.g[n];if(o)for(const a in r){const v=r[a];o.rotation[a]=v[0]+(v[1]||0)*Math.sin(t*(v[2]||0))}}
+}
+const GOALS={   // true を返すとそのtickの担当(以降のゴールは評価しない)
+  carried(m){const c=m.carried;if(!c)return 0;m.x=c.x;m.y=c.y-c.def.errand.hang;m.z=c.z;m.yaw=c.yaw;m.ps='hang';return 1},
+  lookAt(m,dt,o,px,pz,dp){if(m.carried)return 0;if(dp<o.within)m.look=clamp(wrap(faceTo(m,px,pz)-m.yaw),-1,1);else m.look*=.9;return 0},
+  leave(m,dt,o,px,pz,dp){if(m.st!=='leave')return 0;m.x+=-Math.sin(m.yaw)*6.5*dt;m.z+=-Math.cos(m.yaw)*6.5*dt;m.y+=3.2*dt;m.ps='fly';if(dp>54)mobs.remove(m);return 1},
+  bring(m,dt){if(m.st!=='bring')return 0;
+    const dx=m.tx-m.x,dz=m.tz-m.z,d=Math.hypot(dx,dz);m.ps='fly';
+    if(d>1){m.yaw=faceTo(m,m.tx,m.tz);m.x+=dx/d*9*dt;m.z+=dz/d*9*dt;m.y+=clamp(m.gy+10-m.y,-3*dt,3*dt)}
+    else{m.y-=2.4*dt;if(m.y<=m.gy+1.4){const v=m.cargo;v.carried=null;v.x=m.x;v.y=m.y-m.def.errand.hang;v.z=m.z;v.vy=0;m.cargo=null;m.st='idle';m.wild=true;m.vy=2.5;m.on=0}}
+    return 1},
+  eat(m,dt){if(m.st!=='eat')return 0;
+    if((m.t-=dt)<=0){const a=Math.random()*6.28;m.yaw=Math.atan2(-Math.cos(a),-Math.sin(a));m.st='leave';const E=m.def.errand;if(E)mobs.errands.push({t:E.delay[0]+Math.random()*(E.delay[1]-E.delay[0]),a,by:m.type});return 1}
+    mobs.walk(m,dt,0);m.ps='peck';return 1},
+  approach(m,dt,o,px,pz,dp){if(ctl.block!==ID[o.item]||dp>=o.within)return 0;turn(m,faceTo(m,px,pz),dt,6);mobs.walk(m,dt,dp>1.3?o.speed:0);return 1},
+  wander(m,dt,o){mobs.walk(m,dt,mobs.wander(m,dt,o.speed));return 1}
+};
+const mobs={list:[],errands:[],park:[],seen:new Set(),T:0,spawnT:3,syncT:1,
+  add(type,vr,x,y,z){
+    const def=MOBS[type],b=buildMob(def,def.variants&&def.variants[vr]);
+    const m={type,def,vr,...b,x,y,z,r:def.r,h:def.h,yaw:Math.random()*6.28,vy:0,on:0,st:'idle',t:1+Math.random()*2,ty:0,look:0,acc:0,k:0,wild:false};
+    if(def.home){m.hx=x;m.hz=z}
+    scene.add(m.root);this.list.push(m);return m;
+  },
+  remove(m){m.dead=1;scene.remove(m.root);m.root.traverse(o=>o.geometry&&o.geometry.dispose());const i=this.list.indexOf(m);if(i>=0)this.list.splice(i,1)},
+  clear(){for(const m of this.list.slice())this.remove(m);this.errands=[];this.park=[];this.seen=new Set()},
+  shift(dx,dz){if(Math.abs(dx)+Math.abs(dz)>4096){for(const m of this.list.slice()){if(m.def.persist)this.park.push(this.rec(m));this.remove(m)}return}   // 大ジャンプ: 桁落ちする前にチャンク相対で退避
+    for(const m of this.list)for(const [a,b] of [['x','z'],['hx','hz'],['tx','tz']])if(m[a]!==undefined){m[a]-=dx;m[b]-=dz}},
+  rec(m){const fx=Math.floor(m.x/16),fz=Math.floor(m.z/16);return [m.type,m.vr,origin.x/16+fx,origin.z/16+fz,+(m.x-fx*16).toFixed(3),+m.y.toFixed(2),+(m.z-fz*16).toFixed(3)]},   // チャンク相対(原点に依存せず全域で同じ精度)
+  onChunk(c){   // チャンク受信時: そこに原点がある構造物の entities を、未出現なら1回だけ出す
+    for(const s of c.structs||[]){
+      if(Math.floor(s.x/16)!==c.cx||Math.floor(s.z/16)!==c.cz)continue;
+      const E=STRUCT[s.n]&&STRUCT[s.n].entities,k=s.n+'@'+s.x+','+s.z;if(!E||this.seen.has(k))continue;
+      this.seen.add(k);
+      for(const e of E){const vs=MOBS[e.type].variants&&Object.keys(MOBS[e.type].variants);
+        for(let i=0,n=e.count[0]+(Math.random()*(e.count[1]-e.count[0]+1)|0);i<n;i++)
+          this.add(e.type,vs?vs[Math.random()*vs.length|0]:null,(s.x-origin.x)+.5+(Math.random()-.5)*3,s.y+.05,(s.z-origin.z)+.5+(Math.random()-.5)*3)}
+    }
+  },
+  spawnRec(r){return this.add(r[0],r[1],(r[2]*16-origin.x)+r[4],r[5],(r[3]*16-origin.z)+r[6])},
+  sync(){   // 保存対象MOBは範囲外で退避、範囲内に入ったら復帰
+    const pcx=ctl.chunkX(),pcz=ctl.chunkZ(),R=Math.min(GFX.sim,CONFIG.streaming.renderDistance);
+    for(const m of this.list.slice()){   // 範囲外: 保存対象は退避、常駐(非自然湧き)の非保存MOBは破棄
+      if(m.carried||m.cargo||m.st==='leave'||m.st==='bring')continue;
+      const r=this.rec(m);if(Math.hypot(r[2]-pcx,r[3]-pcz)<=R+3||(!m.def.persist&&m.wild))continue;
+      if(m.def.persist)this.park.push(r);this.remove(m)}
+    for(let i=this.park.length-1;i>=0;i--){const r=this.park[i];if(Math.hypot(r[2]-pcx,r[3]-pcz)<=R){this.park.splice(i,1);this.spawnRec(r)}}
+  },
+  save(){return [...this.list.filter(m=>m.def.persist).map(m=>this.rec(m)),...this.park]},
+  load(p){this.park=(p.mobs||[]).slice();
+    for(const v of p.vil||[]){const fx=Math.floor(v[0]/16),fz=Math.floor(v[2]/16);this.park.push(['villager',v[3],p.ox/16+fx,p.oz/16+fz,v[0]-fx*16,v[1],v[2]-fz*16])}   // 旧形式(原点相対)の変換
+    this.seen=new Set(p.spawned||[]);this.errands=(p.err||[]).map(e=>({t:e[0],a:e[1],by:e[2]||'pigeon'}))},
+  ground(x,z,top){const X=blk('x',x),Z=blk('z',z);if(!world.chunk(Math.floor(X/16),Math.floor(Z/16)))return -1;
+    for(let y=Math.min(H-1,Math.floor(top));y>0;y--)if(SOLID[get(X,y,Z)])return y+1;return -1},
+  open(x,z,gy){for(let k=0;k<25;k++)if(solid(blk('x',x),gy+k,blk('z',z)))return false;return true},
+  spawnNatural(){   // MOBS[*].spawn の規則で自然湧き
+    for(const [type,d] of Object.entries(MOBS)){const s=d.spawn;if(!s)continue;
+      if(this.list.filter(m=>m.type===type&&m.wild).length>=s.cap)continue;
+      const a=Math.random()*6.28,r=s.ring[0]+Math.random()*(s.ring[1]-s.ring[0]),x=ctl.position.x+Math.cos(a)*r,z=ctl.position.z+Math.sin(a)*r,gy=this.ground(x,z,ctl.position.y+30);
+      if(gy<1||FK[get(blk('x',x),gy,blk('z',z))]||!s.on.some(n=>ID[n]===get(blk('x',x),gy-1,blk('z',z))))continue;
+      for(let i=0,n=s.group[0]+(Math.random()*(s.group[1]-s.group[0]+1)|0);i<n;i++){const bx=x+(Math.random()-.5)*4,bz=z+(Math.random()-.5)*4,by=this.ground(bx,bz,gy+3);if(by>0&&!FK[get(blk('x',bx),by,blk('z',bz))])this.add(type,null,bx,by+.05,bz).wild=true}
+    }
+  },
+  arrive(e){   // お使い完了: MOBS[e.by].errand の定義どおりに、運び手が積み荷を吊るして戻ってくる
+    const E=MOBS[e.by].errand,C=E.cargo,px=ctl.position.x,pz=ctl.position.z;let L=null;
+    for(let i=0;i<14&&!L;i++){const a=Math.random()*6.28,d=3+Math.random()*5,x=px+Math.cos(a)*d,z=pz+Math.sin(a)*d,gy=this.ground(x,z,ctl.position.y+12);
+      if(gy>0&&this.open(x,z,gy))L={x,z,gy}}
+    L=L||{x:px+2,z:pz,gy:Math.floor(ctl.position.y-ctl.eyeHeight)};
+    const p=this.add(e.by,null,px+Math.cos(e.a)*E.dist,L.gy+14,pz+Math.sin(e.a)*E.dist),v=this.add(C.type,C.variants[Math.random()*C.variants.length|0],p.x,p.y-E.hang,p.z);
+    Object.assign(p,{st:'bring',tx:L.x,tz:L.z,gy:L.gy,cargo:v});v.carried=p;v.hx=L.x;v.hz=L.z;toast(E.toast);
+  },
+  walk(m,dt,sp){phys(m,dt,-Math.sin(m.yaw)*sp,-Math.cos(m.yaw)*sp);if(m.bump){m.bump=0;m.ty=Math.random()*6.28}
+    m.air=m.on?0:(m.air||0)+dt;m.ps=m.def.air&&m.air>.15?'fly':sp?'walk':m.def.idle||'idle'},
+  wander(m,dt,s){
+    if(m.st==='walk'){if((m.t-=dt)<=0){m.st='idle';m.t=1+Math.random()*3}turn(m,m.ty,dt,4);return s}
+    if((m.t-=dt)<=0){m.st='walk';m.t=1+Math.random()*2;m.ty=m.hx!==undefined&&Math.hypot(m.x-m.hx,m.z-m.hz)>10?faceTo(m,m.hx,m.hz):Math.random()*6.28}
+    return 0;
+  },
+  update(dt){
+    this.T+=dt;const px=ctl.position.x,py=ctl.position.y,pz=ctl.position.z;
+    for(let i=this.errands.length-1;i>=0;i--){const e=this.errands[i];if((e.t-=dt)<=0){this.errands.splice(i,1);this.arrive(e)}}
+    if((this.spawnT-=dt)<=0){this.spawnT=8;this.spawnNatural()}if((this.syncT-=dt)<=0){this.syncT=1;this.sync()}
+    for(const m of this.list.slice())this.tick(m,dt,px,pz);
+  },
+  tick(m,dt,px,pz){
+    const fly=m.st==='leave'||m.st==='bring',car=m.carried;
+    if(!fly&&!car&&!world.chunk(Math.floor(blk('x',m.x)/16),Math.floor(blk('z',m.z)/16))){m.root.visible=false;return}   // 未読み込みチャンクでは凍結
+    const dp=Math.hypot(m.x-px,m.z-pz),sp=m.def.spawn;m.root.visible=fly||car||dp<=GFX.mobd;   // MOB描画距離の外は描かない
+    m.acc+=dt;if(dp>32&&!fly&&!car&&(++m.k&3))return;dt=m.acc;m.acc=0;   // 遠いMOBは1/4の頻度で更新
+    if(m.y<-10||(m.wild&&sp&&dp>sp.despawn)){this.remove(m);return}
+    m.ps='idle';
+    for(const [g,o] of m.def.goals)if(GOALS[g](m,dt,o||{},px,pz,dp))break;
+    if(m.dead)return;
+    if(!fly&&!car&&dp<.6){m.x+=(m.x-px)*dt*4;m.z+=(m.z-pz)*dt*4}   // プレイヤーに重ならない
+    m.root.position.set(m.x,m.y,m.z);m.root.rotation.y=m.yaw;
+    pose(m,m.ps,this.T);if(m.def.headTurn&&m.g.head)m.g.head.rotation.y=m.look;
+  },
+  aim(c){   // 視線と各MOBの当たり判定箱の交差(スラブ法)
+    const o=c.position,d=c.look();let best=null;
+    for(const m of this.list){
+      if(m.carried||!m.root.visible)continue;
+      let t0=0,t1=c.reach;
+      for(const [a,lo,hi] of [['x',m.x-m.r,m.x+m.r],['y',m.y,m.y+m.h],['z',m.z-m.r,m.z+m.r]]){
+        if(Math.abs(d[a])<1e-6){if(o[a]<lo||o[a]>hi)t1=-1;continue}
+        let a0=(lo-o[a])/d[a],a1=(hi-o[a])/d[a];if(a0>a1)[a0,a1]=[a1,a0];
+        t0=Math.max(t0,a0);t1=Math.min(t1,a1);
+      }
+      if(t0<=t1&&(!best||t0<best.d))best={m,d:t0};
+    }
+    return best;
+  },
+  interact(m,b,c){   // MOBS[*].interact のデータを解釈するだけ
+    const i=m.def.interact&&m.def.interact[b];if(!i)return;
+    if(i.holding&&c.block!==ID[i.holding])return;
+    if((i.wild&&!m.wild)||(i.states&&!i.states.includes(m.st)))return;
+    if(i.consume){c.hotbar[c.slot]=0;c.inventory.render()}
+    if(i.set)Object.assign(m,i.set);if(i.hop){m.vy=i.hop;m.on=0}
+    if(i.say){const L=m.def.variants[m.vr].lines;toast(L[Math.random()*L.length|0])}else if(i.toast)toast(i.toast);
+  }
+};
+let plantT=.25,plantStep=0;
+function plantList(c){if(c.pl)return c.pl;const pl=c.pl=new Set(),d=c.data;   // チャンクごとの植物位置(初回だけ走査、以降は setBlock が更新)
+  for(let y=c.lo;y<=c.hi&&y<H;y++){const o=y*256;for(let i=0;i<256;i++)if(PLANT[d[o+i]])pl.add(o+i)}return pl}
+function plantsTick(dt){   // 成長: 各植物が PLANT[id].avg 秒に1回ほど進む。シミュレーション編集なので自然チャンクは保存対象にならない
+  if((plantT-=dt)>0)return;plantT=.25;plantStep++;
+  const pcx=ctl.chunkX(),pcz=ctl.chunkZ();
+  for(const c of world.chunks.values()){
+    if(!c.meshed||Math.abs(c.cx-pcx)>3||Math.abs(c.cz-pcz)>3||((c.cx+c.cz+plantStep)&3))continue;
+    for(const k of plantList(c)){const p=PLANT[c.data[k]];
+      if(p&&p.next&&Math.random()<1/p.avg)setBlock(c.cx*16+(k&15),k>>8,c.cz*16+((k>>4)&15),p.next,true)}
+  }
+}
+
+// ================= 流体シミュレーション(水の流れ) =================
+// イベント駆動: 流体の近くでブロックが変わったときだけ、そのセルと隣を更新キューに入れる(自然生成の海は編集されるまで動かない)。
+// 水源(レベル最大)は下→横の順に広がる。流れブロックは「上に流体 or 横の高レベル流体」から供給され、無ければ消える。
+// 流れの変更は sim:true なので、編集されていない自然チャンクは保存されない。
+const FD4=[[1,0],[-1,0],[0,1],[0,-1]],FTICK=BLOCKS.water.fluid.flow.tickMs/1000,fq=[],fqs=new Set();let fT=0;
+const fOpen=t=>t===0||FB[t]===1;   // 流れ込める(空気・流れに壊される植物)
+function fluidNear(x,y,z){return FK[get(x+1,y,z)]||FK[get(x-1,y,z)]||FK[get(x,y,z+1)]||FK[get(x,y,z-1)]||FK[get(x,y+1,z)]||FK[get(x,y-1,z)]}
+function fluidWake(x,y,z){
+  for(const d of [[0,0,0],[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]]){
+    const X=x+d[0],Y=y+d[1],Z=z+d[2];if(Y<0||Y>=H)continue;
+    const k=X+','+Y+','+Z;if(!fqs.has(k)){fqs.add(k);fq.push([X,Y,Z])}
+  }
+}
+function fluidUpdate(dt){
+  if((fT+=dt)<FTICK)return;fT=0;
+  for(let n=0;n<300&&fq.length;n++){
+    const [x,y,z]=fq.shift();fqs.delete(x+','+y+','+z);
+    if(!world.chunk(Math.floor(x/16),Math.floor(z/16)))continue;
+    const t=get(x,y,z),f=FK[t];if(!f)continue;
+    const ids=FIDS[FKN[f]],S=ids.length-1,lv=LV[t],fl=BLK[t].fluid.flow,bt=get(x,y-1,z);
+    if(lv<S){   // 流れブロック: 供給の確認 → 減衰/更新/無限水源化
+      let feed=FK[get(x,y+1,z)]===f?S-1:0,src=0;
+      for(const [a,b] of FD4){const nt=get(x+a,y,z+b);if(FK[nt]!==f)continue;const nl=LV[nt];if(nl===S)src++;if(!fOpen(get(x+a,y-1,z+b))&&nl-1>feed)feed=nl-1}
+      if(fl.infiniteSource&&src>=2&&(SOLID[bt]||(FK[bt]===f&&LV[bt]===S))){setBlock(x,y,z,ids[S],true);continue}
+      if(feed!==lv){setBlock(x,y,z,feed?ids[feed]:0,true);continue}
+    }
+    if(fOpen(bt)){setBlock(x,y-1,z,ids[S-1],true);continue}   // 下へ落ちる
+    if(FK[bt]===f&&LV[bt]<S-1)setBlock(x,y-1,z,ids[S-1],true);
+    if(lv>1)for(const [a,b] of FD4){const nt=get(x+a,y,z+b);if(fOpen(nt)||(FK[nt]===f&&LV[nt]<lv-1))setBlock(x+a,y,z+b,ids[lv-1],true)}   // 横へ広がる
+  }
+}
+// ---------- Save / Load ----------
+const NAMES={},UNKNOWN={};for(const [n,b] of Object.entries(BLOCKS))NAMES[b.id]=n;NAMES[1000]='bean';
+const isBlock=n=>Object.prototype.hasOwnProperty.call(BLOCKS,n);
+const blockName=id=>NAMES[id]||UNKNOWN[id];
+const MAX_BLOCK_ID=Math.max(...Object.values(BLOCKS).map(b=>b.id));
+let nextUnknown=255;
+function registerUnknown(name){
+  for(const id in UNKNOWN)if(UNKNOWN[id]===name)return +id;
+  const id=nextUnknown--;if(id<=MAX_BLOCK_ID)throw new Error('未知のブロックが多すぎます');
+  UNKNOWN[id]=name;SOLID[id]=1;OPAQUE[id]=1;LIGHTBLOCK[id]=1;
+  FACE_TEX[id]={top:'missing',bottom:'missing',side:'missing'};
+  const u=uvOf('missing');FACE_UV[id]={top:u,bottom:u,side:u};calcCut(id);
+  syncTables();   // ワーカーのブロック表にも反映
+  return id;
+}
+function paletteNow(){const p={};for(const n in BLOCKS)p[n]=BLOCKS[n].id;for(const id in UNKNOWN)p[UNKNOWN[id]]=+id;return p}
+function playerState(){return {ox:origin.x,oz:origin.z,x:ctl.position.x,y:ctl.position.y,z:ctl.position.z,yaw:ctl.yaw,pitch:ctl.pitch,slot:ctl.slot,hotbar:ctl.hotbar.map(id=>id?blockName(id):null),spawned:[...mobs.seen],mobs:mobs.save(),err:mobs.errands.map(e=>[e.t,e.a,e.by])}}
+function makeMap(blocks){
+  if(!blocks||typeof blocks!=='object')throw new Error('ブロック表がありません');
+  const map=[];
+  for(const [name,id] of Object.entries(blocks)){
+    if(!Number.isInteger(id)||id<0||id>255||map[id]!==undefined)throw new Error('ブロック表が不正です');
+    map[id]=name==='air'?0:isBlock(name)?BLOCKS[name].id:registerUnknown(name);
+  }
+  if(map[0]!==0)throw new Error('ブロック表に air がありません');
+  return map;
+}
+function readPlayer(p){
+  if(!p||typeof p!=='object')return null;
+  const n=v=>Number.isFinite(v)&&Math.abs(v)<1e15?v:null,x=n(p.x),y=n(p.y),z=n(p.z);
+  if(x===null||y===null||z===null)return null;
+  const hot=Array.isArray(p.hotbar)?p.hotbar.slice(0,CONFIG.hotbarSize).map(s=>typeof s==='string'?(s==='bean'?1000:isBlock(s)?BLOCKS[s].id:registerUnknown(s)):0):null;
+  const lim=v=>Number.isSafeInteger(v)?Math.max(-COORD_LIMIT,Math.min(COORD_LIMIT,Math.floor(v/16)*16)):0;
+  return {ox:lim(p.ox),oz:lim(p.oz),x,y,z,yaw:n(p.yaw)??0,pitch:Math.max(-1.5,Math.min(1.5,n(p.pitch)??0)),hotbar:hot,spawned:Array.isArray(p.spawned)?p.spawned.slice(0,5000).filter(k=>typeof k==='string'&&k.length<64):[],mobs:Array.isArray(p.mobs)?p.mobs.slice(0,500).filter(r=>Array.isArray(r)&&MOBS.hasOwnProperty(r[0])&&(!MOBS[r[0]].variants||MOBS[r[0]].variants[r[1]])&&Number.isSafeInteger(r[2])&&Number.isSafeInteger(r[3])&&[r[4],r[5],r[6]].every(Number.isFinite)):[],vil:Array.isArray(p.vil)?p.vil.slice(0,500).filter(v=>Array.isArray(v)&&v.slice(0,3).every(Number.isFinite)&&!!MOBS.villager.variants[v[3]]):[],err:Array.isArray(p.err)?p.err.slice(0,50).filter(e=>Array.isArray(e)&&Number.isFinite(e[0])&&Number.isFinite(e[1])&&(e[2]===undefined||(MOBS.hasOwnProperty(e[2])&&!!MOBS[e[2]].errand))):[],
+    slot:Number.isInteger(p.slot)&&p.slot>=0&&p.slot<CONFIG.hotbarSize?p.slot:CONFIG.startSlot};
+}
+
+// ファイル形式(JSON): 編集済みチャンクのみを書き出すため超軽量(数KB〜)
+function fnv(u8){let h=0x811c9dc5;for(let i=0;i<u8.length;i++){h^=u8[i];h=Math.imul(h,16777619)}return h>>>0}
+async function pipe(u8,Stream,kind){
+  const st=new Stream(kind),w=st.writable.getWriter();
+  w.write(u8).catch(()=>{});w.close().catch(()=>{});
+  return new Uint8Array(await new Response(st.readable).arrayBuffer());
+}
+const gzip=u8=>pipe(u8,CompressionStream,'gzip'),gunzip=u8=>pipe(u8,DecompressionStream,'gzip');
+function b64enc(u8){let s='';for(let i=0;i<u8.length;i+=32768)s+=String.fromCharCode.apply(null,u8.subarray(i,i+32768));return btoa(s)}
+function b64dec(s){const t=atob(s),u=new Uint8Array(t.length);for(let i=0;i<t.length;i++)u[i]=t.charCodeAt(i);return u}
+
+async function exportWorld(){
+  flushDirty();
+  const recs=world.store.values();let total=0;for(const r of recs)total+=r.b.length;
+  const buf=new Uint8Array(total),index=[];let off=0;
+  for(const r of recs){buf.set(r.b,off);off+=r.b.length;index.push(r.cx,r.cz,r.gen,r.hi,r.lo,r.b.length)}
+  const gz=typeof CompressionStream==='function';
+  return JSON.stringify({format:'voxel-world',schema:SCHEMA,gen:GEN_VERSION,savedAt:new Date().toISOString(),seed:SEED,
+    blocks:paletteNow(),player:playerState(),compression:gz?'gzip':'none',check:fnv(buf),index,payload:b64enc(gz?await gzip(buf):buf)});
+}
+async function parseSave(text){
+  try{
+    let f;try{f=JSON.parse(text)}catch(e){return {error:'JSONとして読めません(壊れているか、別のファイルです)'}}
+    if(!f||f.format!=='voxel-world'||!Number.isInteger(f.schema)||f.schema<1)return {error:'ワールドファイルではありません'};
+    if(f.schema>SCHEMA)return {error:`新しい版のファイルです(schema ${f.schema} > ${SCHEMA})。ゲームを更新してください`};
+    while(f.schema<SCHEMA){const m=MIGRATIONS[f.schema];if(!m)return {error:`schema ${f.schema} からの変換がありません`};f=m(f)}
+    if(!Number.isSafeInteger(f.seed))throw new Error('シードが不正です');
+    const map=makeMap(f.blocks),idx=f.index;
+    if(!Array.isArray(idx)||idx.length%6||idx.length>6*MAX_CHUNKS||typeof f.payload!=='string')throw new Error('index が不正です');
+    let raw=b64dec(f.payload);
+    if(f.compression==='gzip'){if(typeof DecompressionStream!=='function')throw new Error('この環境は gzip を展開できません');try{raw=await gunzip(raw)}catch(e){throw new Error('圧縮データが壊れています')}}
+    else if(f.compression!=='none')throw new Error('圧縮形式が不正です');
+    if(fnv(raw)!==f.check)throw new Error('チェックサムが一致しません(途中で切れたか、書き換えられています)');
+    const chunks=[];let off=0;
+    for(let i=0;i<idx.length;i+=6){
+      const [cx,cz,gen,hi,lo,len]=idx.slice(i,i+6);
+      if(!Number.isSafeInteger(cx)||!Number.isSafeInteger(cz)||![gen,hi,lo,len].every(Number.isInteger))throw new Error('index の値が不正です');
+      if(hi<0||hi>=H||lo<0||lo>=H||len<1||off+len>raw.length)throw new Error('index の範囲が不正です');
+      const b=raw.slice(off,off+len);off+=len;
+      if(!checkRle(b,(hi+1)*256,map))throw new Error(`チャンク(${cx},${cz})のデータが不正です`);
+      if(world.inBounds(cx,cz))chunks.push({cx,cz,gen,hi,lo,b});
+    }
+    if(off!==raw.length)throw new Error('payload の長さが合いません');
+    return {save:{seed:f.seed,chunks,player:readPlayer(f.player)}};
+  }catch(e){return {error:'ファイルが壊れています: '+(e&&e.message||e)}}
+}
+
+// スポーン: 地面の高さはチャンクが届いてから決める(届くまでプレイヤーは止まったまま)
+// ---------- スポーン: 可能なら X=0,Z=0 の地上、無理ならそこに最も近い「安全な地上」へ ----------
+// 安全な地上 = 最上面が 固体 かつ 水・木の幹・葉・半透明ブロック以外で、その上に2マスの空間がある地点(植物は無視)
+const SPAWN_HOME={x:0,z:0};       // 第一希望の座標
+const SPAWN_R=48;                 // 探索半径(ブロック)。チャンクが読み込まれるのを待ってから探す
+const SPAWN_WAIT_MS=20000;        // 周囲チャンクの読み込み待ちの上限(超えたら読み込み済みの範囲だけで探す)
+const SPAWN_OFFS=(()=>{const a=[];for(let i=-4;i<=4;i++)for(let j=-4;j<=4;j++)if(i||j)a.push([i,j]);return a.sort((p,q)=>p[0]**2+p[1]**2-q[0]**2-q[1]**2)})();   // 周囲が全部海などのとき、探索の中心を64ブロックずつ外へずらす順番
+let spawnTarget=null;
+function spawn(x=SPAWN_HOME.x,z=SPAWN_HOME.z){spawnTarget={x,z,hx:x,hz:z,stage:0,t0:performance.now(),homeTried:false,final:false};ctl.velocity.set(0,0,0)}
+function placeAt(x,z,eyeY){   // 絶対ブロック座標(x,z)の中心・目の高さ eyeY にプレイヤーを置く(原点を再設定して座標の桁落ちを防ぐ)
+  rebase(Math.floor(x/16)*16,Math.floor(z/16)*16);
+  ctl.position.set(x+.5-origin.x,eyeY,z+.5-origin.z);
+}
+const isTreeBlock=id=>id===ID.leaves||id===ID.log||id===ID.birch_log;
+// 戻り値: 足場ブロックのY(安全) / -1(不可) / -2(チャンク未読込)
+function groundAt(x,z){
+  const cx=Math.floor(x/16),cz=Math.floor(z/16),c=world.chunk(cx,cz);
+  if(!c||!c.data)return world.inBounds(cx,cz)?-2:-1;
+  for(let y=H-1;y>0;y--){
+    const id=get(x,y,z);
+    if(!id||CROSS[id])continue;                                 // 空気・植物は素通り
+    if(!SOLID[id]||FK[id]||TRANS[id]||isTreeBlock(id))return -1; // 水中・木の上・葉の上は不可
+    const a=get(x,y+1,z),b=get(x,y+2,z);
+    if(SOLID[a]||FK[a]||SOLID[b]||FK[b])return -1;               // 頭上に空間が無い
+    return y;
+  }
+  return -1;
+}
+function finishSpawn(x,z,y){spawnTarget=null;placeAt(x,z,y+1+ctl.eyeHeight+.01);ctl.velocity.set(0,0,0)}
+function trySpawn(){
+  const s=spawnTarget; if(!s)return;
+  const cx=Math.floor(s.x/16),cz=Math.floor(s.z/16);
+  if(!world.inBounds(cx,cz)){nextSpawnStage(s);return}
+  const c=world.chunk(cx,cz); if(!c||!c.data)return;             // 探索中心のチャンクが読み込まれるまで待つ
+  if(s.final){                                                    // 最終手段: 安全な場所が見つからなければ最上面(水面など)に置く
+    let y=H-1;while(y>0&&(!get(s.x,y,s.z)||CROSS[get(s.x,y,s.z)]))y--;
+    finishSpawn(s.x,s.z,y);return;
+  }
+  if(s.stage===0&&!s.homeTried){                                   // まず第一希望の地点そのものを確認
+    s.homeTried=true;
+    const y=groundAt(s.hx,s.hz);
+    if(y>=0){finishSpawn(s.hx,s.hz,y);return}
+  }
+  // 周囲(半径 SPAWN_R)のチャンクが揃うのを待ち、第一希望に最も近い安全な地上を探す
+  let missing=false;
+  for(let kz=Math.floor((s.z-SPAWN_R)/16);kz<=Math.floor((s.z+SPAWN_R)/16);kz++)
+    for(let kx=Math.floor((s.x-SPAWN_R)/16);kx<=Math.floor((s.x+SPAWN_R)/16);kx++){
+      if(!world.inBounds(kx,kz))continue;
+      const k=world.chunk(kx,kz); if(!k||!k.data)missing=true;
+    }
+  const now=performance.now();
+  if(!s.tw)s.tw=now;
+  if(missing&&now-s.tw<SPAWN_WAIT_MS)return;
+  let best=null,bd=Infinity;
+  for(let dz=-SPAWN_R;dz<=SPAWN_R;dz++)for(let dx=-SPAWN_R;dx<=SPAWN_R;dx++){
+    const x=s.x+dx,z=s.z+dz,d=(x-s.hx)*(x-s.hx)+(z-s.hz)*(z-s.hz);
+    if(d>=bd)continue;
+    const y=groundAt(x,z); if(y>=0){best={x,z,y};bd=d}
+  }
+  if(best){finishSpawn(best.x,best.z,best.y);return}
+  nextSpawnStage(s);                                              // 範囲内が全部水中・木などなら、探索の中心を外側へずらす
+}
+function nextSpawnStage(s){
+  s.stage++;s.tw=0;
+  if(s.stage>SPAWN_OFFS.length){s.x=s.hx;s.z=s.hz;s.final=true;return}
+  const o=SPAWN_OFFS[s.stage-1];s.x=s.hx+o[0]*64;s.z=s.hz+o[1]*64;
+}
+function playerReady(){   // 足元のチャンクのデータとメッシュが揃うまで物理を止める
+  if(spawnTarget)return false;
+  const cx=ctl.chunkX(),cz=ctl.chunkZ();
+  if(!world.inBounds(cx,cz))return true;
+  const c=world.chunks.get(cx,cz);
+  return !!(c&&c.meshed);
+}
+function newWorld(){
+  for(const c of world.chunks.values())dropMesh(c);
+  world.chunks=new ChunkMap();world.store=new ChunkMap();world.changed=new ChunkMap();world.hasLegacy=false;world.last=null;
+  SEED=(Math.random()*0x100000000)|0;
+  stream.cx=NaN;stream.cz=NaN;stream.wanted=[];stream.i=0;
+  resetWorld();
+  idb.reset=true;
+  ctl.velocity.set(0,0,0);ctl.keys={};ctl.yaw=0;ctl.pitch=0;ctl.slot=CONFIG.startSlot;
+  ctl.hotbar=Array.from({length:CONFIG.hotbarSize},(_,i)=>ID[CONFIG.hotbar[i]]||0);mobs.clear();
+  spawn();
+  ctl.inventory.render();editedSinceSave=false;
+}
+function applySave(sv,markChanged=true){
+  for(const c of world.chunks.values())dropMesh(c);
+  world.chunks=new ChunkMap();world.store=new ChunkMap();world.changed=new ChunkMap();world.hasLegacy=false;world.last=null;
+  SEED=sv.seed;
+  for(const r of sv.chunks){world.store.set(r.cx,r.cz,r);if(markChanged)world.changed.set(r.cx,r.cz,r);if(r.gen!==GEN_VERSION)world.hasLegacy=true}
+  stream.cx=NaN;stream.cz=NaN;stream.wanted=[];stream.i=0;
+  resetWorld();
+  if(markChanged)idb.reset=true;
+  const p=sv.player;mobs.clear();if(p)mobs.load(p);ctl.velocity.set(0,0,0);ctl.keys={};
+  if(p){spawnTarget=null;origin.x=p.ox;origin.z=p.oz;ctl.position.set(p.x,p.y,p.z);ctl.yaw=p.yaw;ctl.pitch=p.pitch;ctl.slot=p.slot;
+    if(p.hotbar)ctl.hotbar=Array.from({length:CONFIG.hotbarSize},(_,i)=>p.hotbar[i]||0)}
+  else spawn();
+  ctl.inventory.render();editedSinceSave=false;
+}
+
+// 出力/入力
+async function saveFile(text,name){
+  try{
+    const dl=typeof claude!=='undefined'&&claude.use?await claude.use('downloads'):null;
+    if(dl){await dl.save({filename:name,data:text});return 'saved'}
+  }catch(e){if(e&&e.code==='declined')return 'declined'}
+  const url=URL.createObjectURL(new Blob([text],{type:'application/json'})),a=document.createElement('a');
+  a.href=url;a.download=name;document.body.appendChild(a);a.click();a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),10000);
+  return 'started';
+}
+function pickFile(){
+  return new Promise(res=>{
+    const i=document.createElement('input');i.type='file';i.accept='.json,application/json';
+    i.onchange=async()=>{const f=i.files&&i.files[0];res(f?await f.text():null)};
+    i.oncancel=()=>res(null);i.click();
+  });
+}
+const stamp=()=>{const d=new Date(),p=n=>String(n).padStart(2,'0');return d.getFullYear()+p(d.getMonth()+1)+p(d.getDate())+'-'+p(d.getHours())+p(d.getMinutes())};
+
+// ---------- 自動保存 (IndexedDB: 編集済み差分のみ保存) ----------
+const idb={db:null,reset:false,
+  open(){return new Promise(res=>{try{
+    if(typeof indexedDB==='undefined')return res(null);
+    const r=indexedDB.open('voxel-world',1);
+    r.onupgradeneeded=()=>{r.result.createObjectStore('meta');r.result.createObjectStore('chunks')};
+    r.onsuccess=()=>res(r.result);r.onerror=r.onblocked=()=>res(null);
+    setTimeout(()=>res(null),2000);
+  }catch(e){res(null)}})},
+  load(){return new Promise((res,rej)=>{
+    const tx=this.db.transaction(['meta','chunks'],'readonly'),m=tx.objectStore('meta').get('main'),c=tx.objectStore('chunks').getAll();
+    tx.oncomplete=()=>res(m.result?{meta:m.result,recs:c.result}:null);tx.onerror=tx.onabort=()=>rej(tx.error);
+  })},
+  write(meta,recs,clear){return new Promise((res,rej)=>{
+    const tx=this.db.transaction(['meta','chunks'],'readwrite'),cs=tx.objectStore('chunks');
+    if(clear)cs.clear();
+    for(const r of recs)cs.put(r,r.cx+','+r.cz);
+    tx.objectStore('meta').put(meta,'main');
+    tx.oncomplete=()=>res();tx.onerror=tx.onabort=()=>rej(tx.error);
+  })}
+};
+function saveFromIdb(d){
+  const m=d.meta;if(!Number.isSafeInteger(m.seed)||(m.schema!==1&&m.schema!==SCHEMA))throw new Error('meta');
+  const pl=m.schema===1?player1to2(m.player):m.player;
+  const map=makeMap(m.blocks),chunks=[];
+  for(const r of d.recs){
+    if(!r||!Number.isSafeInteger(r.cx)||!Number.isSafeInteger(r.cz)||!(r.b instanceof Uint8Array)||!(r.hi>=0&&r.hi<H)||!world.inBounds(r.cx,r.cz))continue;
+    const b=r.b.slice();if(checkRle(b,(r.hi+1)*256,map))chunks.push({cx:r.cx,cz:r.cz,gen:r.gen|0,hi:r.hi,lo:r.lo|0,b});
+  }
+  const cur=paletteNow();
+  const same=Object.keys(cur).length===Object.keys(m.blocks).length&&Object.keys(cur).every(k=>cur[k]===m.blocks[k]);
+  return {save:{seed:m.seed,chunks,player:readPlayer(pl)},same};
+}
+let saving=false;
+async function autosave(){
+  if(!idb.db||saving)return false;
+  saving=true;const clear=idb.reset;idb.reset=false;
+  try{
+    flushDirty();
+    const recs=world.changed.values();
+    if(recs.length>0||clear){
+      await idb.write({schema:SCHEMA,seed:SEED,gen:GEN_VERSION,blocks:paletteNow(),player:playerState()},recs,clear);
+      for(const r of recs)if(world.changed.get(r.cx,r.cz)===r)world.changed.delete(r.cx,r.cz);
+    }
+    return true;
+  }catch(e){idb.reset=idb.reset||clear;idb.db=null;return false}
+  finally{saving=false}
+}
+
+// ---------- 一時停止メニュー ----------
+const GFX_ITEMS=[   // [種類, キー, 表示名, ...]
+  ['range','rd','描画距離',2,64,1,v=>v+' チャンク'],
+  ['range','sim','シミュレーション距離',2,12,1,v=>v+' チャンク'],
+  ['bool','mip','ミップマップ(遠景のちらつき軽減)'],
+  ['bool','fog','フォグ'],
+  ['sel','fps','最大FPS',[[30,'30'],[60,'60'],[120,'120'],[0,'無制限']]],
+  ['range','scale','描画解像度',50,200,5,v=>v+'%'],
+  ['bool','auto','解像度の自動調整'],
+  ['sel','part','パーティクル',[[2,'すべて'],[1,'減らす'],[0,'なし']]],
+  ['range','mobd','MOB描画距離',16,64,4,v=>v+' ブロック'],
+  ['bool','water','水の半透明'],
+  ['bool','aa','アンチエイリアス(再読み込み後)'],
+  ['sel','dbg','デバッグ表示',[[0,'なし'],[1,'FPSのみ'],[2,'詳細']]]];
+class PauseMenu{
+  constructor(ctl){
+    this.ctl=ctl;this.open=false;this.pending=null;this.shownAt=0;this.lastStatus='';
+    const st=document.createElement('style');
+    st.textContent=`.pm{display:flex;flex-direction:column;gap:8px;width:min(340px,90vw)}.pm h3{margin:0 0 4px;font:600 14px sans-serif}.pm button{padding:9px 12px;border:0;border-radius:5px;background:#3b82f6;color:#fff;font:13px sans-serif;cursor:pointer}.pm button.sub{background:#4b5563}.pm .st{min-height:3.2em;font:12px sans-serif;color:#cbd5e1;white-space:pre-wrap}.inv.gfx{justify-content:flex-start;padding-left:16px;box-sizing:border-box;background:rgba(0,0,0,.1)}.inv.gfx .pm{width:min(380px,92vw);max-height:92vh;overflow:auto}.gfr{display:flex;align-items:center;gap:8px;font:12px sans-serif}.gfr label{flex:1}.gfr input[type=range]{width:120px}.gfr span{width:74px;text-align:right;color:#cbd5e1}.gfr select{background:#374151;color:#fff;border:0;border-radius:4px;padding:3px}.gfb{display:flex;gap:6px}.gfb button{flex:1}`;
+    document.head.appendChild(st);
+    this.root=document.createElement('div');this.root.className='inv';
+    this.menuHTML='<h3>一時停止</h3><button data-a="resume">続ける</button><button class="sub" data-a="gfx">描画設定</button><button class="sub" data-a="new">新しいワールド</button><button class="sub" data-a="save">ワールドをファイルに保存</button><button class="sub" data-a="load">ファイルから読み込む</button><button data-a="apply" style="display:none"></button><div class="st"></div>';
+    this.root.innerHTML='<div class="pn pm">'+this.menuHTML+'</div>';
+    this.st=this.root.querySelector('.st');this.applyBtn=this.root.querySelector('[data-a=apply]');
+    this.root.addEventListener('click',e=>{const a=e.target&&e.target.dataset&&e.target.dataset.a;if(a)this.act(a)});
+    this.root.addEventListener('input',e=>{if(e.target&&e.target.dataset&&e.target.dataset.g)this.setG(e.target)});
+    document.body.appendChild(this.root);
+  }
+  note(t){this.lastStatus=t;this.st.textContent=t}
+  refresh(){
+    this.note(`${idb.db?'自動保存: 有効(このブラウザ内)':'自動保存: 使えません(ファイルに保存してください)'}\n編集済みチャンク: ${world.store.size}\nメモリ展開中チャンク: ${world.chunks.size}\nチャンク生成: ${engine&&engine.mode==='worker'?'Web Worker':'メインスレッド'}`);
+  }
+  show(){
+    if(this.open)return;
+    this.root.querySelector('.pn').innerHTML=this.menuHTML;
+    this.st=this.root.querySelector('.st');this.applyBtn=this.root.querySelector('[data-a=apply]');
+    this.view='menu';this.root.classList.remove('gfx');this.open=true;this.ctl.keys={};this.shownAt=performance.now();this.root.style.display='flex';this.refresh();
+  }
+  hide(silent){
+    if(!this.open)return;
+    this.open=false;this.pending=null;this.root.classList.remove('gfx');if(this.applyBtn)this.applyBtn.style.display='none';this.root.style.display='none';
+    if(!silent)this.ctl.requestLock();
+  }
+  esc(){if(this.view==='gfx')this.showMenu();else this.hide()}   // 設定画面では Esc で一つ戻る
+  showMenu(){
+    this.view='menu';this.root.classList.remove('gfx');
+    this.root.querySelector('.pn').innerHTML=this.menuHTML;
+    this.st=this.root.querySelector('.st');this.applyBtn=this.root.querySelector('[data-a=apply]');this.refresh();
+  }
+  showGfx(){
+    this.view='gfx';this.root.classList.add('gfx');
+    const row=([t,k,l,a,b,st,f])=>t==='range'?`<div class="gfr"><label>${l}</label><input type="range" data-g="${k}" min="${a}" max="${b}" step="${st}" value="${GFX[k]}"><span data-v="${k}">${f(GFX[k])}</span></div>`
+      :t==='bool'?`<div class="gfr"><label>${l}</label><input type="checkbox" data-g="${k}"${GFX[k]?' checked':''}></div>`
+      :`<div class="gfr"><label>${l}</label><select data-g="${k}">${a.map(([v,n])=>`<option value="${v}"${GFX[k]===v?' selected':''}>${n}</option>`).join('')}</select></div>`;
+    const pn=this.root.querySelector('.pn');
+    pn.innerHTML='<h3>描画設定</h3><div class="gfb"><button class="sub" data-a="p-low">最軽量</button><button class="sub" data-a="p-std">標準</button><button class="sub" data-a="p-high">高品質</button></div>'
+      +GFX_ITEMS.map(row).join('')
+      +'<div class="gfb"><button class="sub" data-a="gfx-reset">初期値に戻す</button><button data-a="back">戻る</button></div><div class="st">変更はすぐ反映され、自動で保存されます。F3 でデバッグ表示を切り替え。\nシミュレーション距離は MOB の活動範囲のみに作用します。</div>';
+    this.st=pn.querySelector('.st');this.applyBtn=null;
+  }
+  setG(el){
+    const k=el.dataset.g,it=GFX_ITEMS.find(i=>i[1]===k);if(!it)return;
+    const v=el.type==='checkbox'?el.checked:+el.value;GFX[k]=v;
+    const sp=this.root.querySelector(`[data-v="${k}"]`);if(sp&&it[0]==='range')sp.textContent=it[6](v);
+    clearTimeout(this.gt);this.gt=setTimeout(()=>{applyGfx();gfxSave()},120);   // スライダー操作中の連続適用を間引く
+  }
+  async act(a){
+    try{
+      if(a==='gfx'){this.showGfx();return}
+      if(a==='back'){this.showMenu();return}
+      if(a==='gfx-reset'||a.startsWith('p-')){Object.assign(GFX,a==='gfx-reset'?GFX_DEF:GFX_PRESET[a.slice(2)]);applyGfx();gfxSave();this.showGfx();return}
+      if(a==='resume')this.hide();
+      else if(a==='new'){
+        this.root.querySelector('.pn').innerHTML='<h3>新しいワールド</h3><div class="st">新しいワールドを作成しますか？\n現在のワールドは保存されていない変更も含めて失われます。</div><button data-a="new-ok">作成する</button><button class="sub" data-a="new-cancel">キャンセル</button>';
+        this.st=this.root.querySelector('.st');
+      }else if(a==='new-ok'){
+        newWorld();this.hide();
+      }else if(a==='new-cancel'){
+        this.root.querySelector('.pn').innerHTML=this.menuHTML;
+        this.st=this.root.querySelector('.st');this.applyBtn=this.root.querySelector('[data-a=apply]');this.refresh();
+      }else if(a==='save'){
+        this.note('書き出し中…');
+        const text=await exportWorld(),name=`voxel-world-${stamp()}.json`,r=await saveFile(text,name);
+        if(r==='declined')this.note('保存をキャンセルしました');
+        else{editedSinceSave=false;this.note(`${r==='saved'?'保存しました':'ダウンロードを開始しました'}\n${name}\n${world.store.size} チャンク(編集部のみ) / ${(text.length/1048576).toFixed(2)} MB`)}
+      }else if(a==='load'){const t=await pickFile();if(t!=null)await this.offer(t)}
+      else if(a==='apply'&&this.pending){applySave(this.pending);this.pending=null;this.hide()}
+    }catch(e){this.note('失敗しました: '+(e&&e.message||e))}
+  }
+  async offer(text){
+    this.show();
+    const r=await parseSave(text);
+    if(r.error){this.pending=null;this.applyBtn.style.display='none';this.note('読み込めません\n'+r.error);return}
+    this.pending=r.save;this.applyBtn.textContent='置き換えて読み込む(いまのワールドは失われます)';this.applyBtn.style.display='';
+    this.note(`ファイルを確認しました: ${r.save.chunks.length} チャンク(編集部) / シード ${r.save.seed}\n続けるには下のボタンを押してください`);
+  }
+}
+ctl.pause=new PauseMenu(ctl);
+
+// ---------- 座標表示(左上) ----------
+// 整数部は blk()(床を取ってから整数の原点を足す)で正確に出す。小数に巨大な原点を足すと 2^49 付近で桁落ちするため
+const hud=document.createElement('div');
+hud.style.cssText='position:fixed;left:calc(8px + env(safe-area-inset-left,0px));top:calc(8px + env(safe-area-inset-top,0px));padding:4px 8px;background:rgba(0,0,0,.45);color:#fff;font:12px/1.5 monospace;border-radius:4px;pointer-events:none;z-index:3;white-space:pre';
+document.body.appendChild(hud);let hudText='';
+function fmtCoord(b,f){let h=Math.round(f*100);if(h===100){b++;h=0}const p=String(h).padStart(2,'0');return b>=0?b+'.'+p:h===0?b+'.00':'-'+(-b-1)+'.'+String(100-h).padStart(2,'0')}
+function biomeName(){
+  const p=ctl.position,bx=blk('x',p.x),bz=blk('z',p.z),cx=Math.floor(bx/16),cz=Math.floor(bz/16),c=world.chunks.get(cx,cz);
+  return c&&c.biome?BIO[c.biome[((bz-cz*16)<<4)+(bx-cx*16)]].label:'-';
+}
+function updateHud(){
+  const p=ctl.position,fx=p.x-Math.floor(p.x),fz=p.z-Math.floor(p.z);
+  const t=`X ${fmtCoord(blk('x',p.x),fx)}\nY ${(p.y-ctl.eyeHeight).toFixed(2)}\nZ ${fmtCoord(blk('z',p.z),fz)}\nチャンク ${ctl.chunkX()}, ${ctl.chunkZ()}${playerReady()?'':'  (読み込み中)'}\nバイオーム ${biomeName()}`;
+  if(t!==hudText){hudText=t;hud.textContent=t}
+}
+// ---------- デバッグ表示(右上): FPS / CPU / GPU時間 / draw call など。F3 で切替 ----------
+const dbgEl=document.createElement('div');
+dbgEl.style.cssText='position:fixed;right:calc(8px + env(safe-area-inset-right,0px));top:calc(8px + env(safe-area-inset-top,0px));padding:4px 8px;background:rgba(0,0,0,.45);color:#fff;font:12px/1.5 monospace;border-radius:4px;pointer-events:none;white-space:pre;display:none;z-index:3';
+document.body.appendChild(dbgEl);
+
+let dN=0,dRaw=0,dCpu=0,dMax=0,dT=0,dTxt='',hudT=0;
+
+// ---------- GPU時間計測 ----------
+const gl=renderer.getContext();
+const gpuExt=gl instanceof WebGL2RenderingContext?gl.getExtension('EXT_disjoint_timer_query_webgl2'):null;
+let gpuQuery=null,gpuMs=0;
+
+function gpuBegin(){
+  if(!gpuExt||gpuQuery)return;
+  gpuQuery=gl.createQuery();
+  gl.beginQuery(gpuExt.TIME_ELAPSED_EXT,gpuQuery);
+}
+
+function gpuEnd(){
+  if(!gpuExt||!gpuQuery)return;
+  gl.endQuery(gpuExt.TIME_ELAPSED_EXT);
+}
+
+function gpuPoll(){
+  if(!gpuExt||!gpuQuery)return;
+  if(!gl.getQueryParameter(gpuQuery,gl.QUERY_RESULT_AVAILABLE))return;
+  if(gl.getParameter(gpuExt.GPU_DISJOINT_EXT)){
+    gl.deleteQuery(gpuQuery);
+    gpuQuery=null;
+    return;
+  }
+  gpuMs=gl.getQueryParameter(gpuQuery,gl.QUERY_RESULT)/1000000;
+  gl.deleteQuery(gpuQuery);
+  gpuQuery=null;
+}
+
+function dbgTick(raw,cpu,now){
+  dN++;dRaw+=raw;dCpu+=cpu;if(cpu>dMax)dMax=cpu;
+  if(now-dT<500)return;
+  const fps=dN*1000/dRaw,cpuAvg=dCpu/dN,cpuMax=dMax;dN=dRaw=dCpu=dMax=0;dT=now;
+  if(!GFX.dbg){dbgEl.style.display='none';return}
+  let t=`Version 0.1.0\nFPS ${fps.toFixed(0)}  (CPU ${cpuAvg.toFixed(1)}ms / 最大 ${cpuMax.toFixed(1)}ms / GPU ${gpuExt?gpuMs.toFixed(1):'-'}ms)`;
+  if(GFX.dbg>1){
+    const i=renderer.info,heap=performance.memory?` / JS ${(performance.memory.usedJSHeapSize/1048576)|0}MB`:'';
+    let ungen=0;
+    for(const [,cx,cz] of stream.wanted){if(!world.chunks.get(cx,cz))ungen++}
+    t+=`\n描画距離 ${GFX.rd}  解像度 x${prCur.toFixed(2)}  ${engine?engine.mode:'-'}`
+      +`\ndraw call ${i.render.calls}  三角形 ${i.render.triangles}  リージョン ${regionBatcher.regions.size}`
+      +`\nチャンク ${world.chunks.size}  処理中 ${pending.size+inbox.length} (未生成 ${ungen})`
+      +`\nチャンクデータ約 ${(world.chunks.size/16)|0}MB${heap}`;
+  }
+  dbgEl.style.display='block';if(t!==dTxt){dTxt=t;dbgEl.textContent=t}
+}
+
+addEventListener('keydown',e=>{if(e.code==='F3'){e.preventDefault();GFX.dbg=(GFX.dbg+1)%3;gfxSave();dT=0}});
+
+// ---------- Loop / Boot ----------
+// 自動解像度: 1秒平均のフレーム時間が長ければ描画解像度を下げ、軽ければ(30秒の冷却後)上限まで戻す
+let arSum=0,arN=0,arHold=0;
+
+function adaptRes(raw,now){
+  if(!RENDER.adaptive)return;
+  arSum+=raw;arN++;if(arSum<1000)return;
+  const avg=arSum/arN;arSum=0;arN=0;let n=prCur;
+  if(avg>22&&prCur>RENDER.minPixelRatio){n=Math.max(RENDER.minPixelRatio,prCur-.25);arHold=now+30000}
+  else if(avg<17.5&&now>arHold&&prCur<Math.min(devicePixelRatio,RENDER.pixelRatio))n=Math.min(RENDER.pixelRatio,devicePixelRatio,prCur+.25);
+  if(n!==prCur){prCur=n;renderer.setPixelRatio(n);renderer.setSize(innerWidth,innerHeight)}
+}
+
+let last=performance.now();
+
+function frame(now){
+  requestAnimationFrame(frame);
+  if(now-last<1000/RENDER.maxFps-1.5)return;
+  const raw=now-last,dt=Math.min(raw/1000,.05);last=now;const tc=performance.now();
+
+  const pcx=spawnTarget?Math.floor(spawnTarget.x/16):ctl.chunkX(),pcz=spawnTarget?Math.floor(spawnTarget.z/16):ctl.chunkZ();
+  updateStreaming(pcx,pcz,CONFIG.streaming.meshBudgetMs);
+  trySpawn();
+  ctl.update(dt,!playerReady()||ctl.pause.open);if(now-hudT>100){hudT=now;updateHud()}
+  particles.update(dt);
+  if(playerReady()&&!ctl.pause.open&&!ctl.inventory.open){mobs.update(dt);plantsTick(dt);fluidUpdate(dt)}
+
+  const h=ctl.locked?ctl.target():null,e=ctl.locked?mobs.aim(ctl):null,em=e&&(!h||e.d<ctl.bd(h));
+  hl.visible=!!h||!!em;hl.scale.set(1,1,1);
+  if(em){const m=e.m;hl.scale.set(m.r*2,m.h,m.r*2);hl.position.set(m.x,m.y+m.h/2,m.z)}
+  else if(h)hl.position.set(h.x+.5-origin.x,h.y+.5,h.z+.5-origin.z);
+
+  gpuPoll();
+  gpuBegin();
+  renderer.render(scene,camera);
+  gpuEnd();
+
+  adaptRes(raw,now);
+  dbgTick(raw,performance.now()-tc,now);
+}
+
+async function boot(){
+  engine=await startEngine();resetWorld();   // 先にワーカーを起動(以降のワールド読み込みは全てワーカーへ通知される)
+  idb.db=await idb.open();
+  let restored=false;
+  if(idb.db){
+    try{const d=await idb.load();if(d){const r=saveFromIdb(d);applySave(r.save,!r.same);restored=true}}
+    catch(e){}
+  }
+  if(!restored)spawn();
+  requestAnimationFrame(frame);
+  setInterval(autosave,15000);
+  document.addEventListener('visibilitychange',()=>{if(document.hidden)autosave()});
+  addEventListener('pagehide',()=>{autosave()});
+  addEventListener('beforeunload',e=>{if(!idb.db&&editedSinceSave){e.preventDefault();e.returnValue=''}});
+  addEventListener('dragover',e=>e.preventDefault());
+  addEventListener('drop',async e=>{e.preventDefault();const f=e.dataTransfer&&e.dataTransfer.files&&e.dataTransfer.files[0];if(f)await ctl.pause.offer(await f.text())});
+}
+// 座標ストレステスト: コンソールで teleport(2**49-1000, 2**49-1000)
+window.teleport=(x,z)=>spawn(Math.floor(x),Math.floor(z));   // 指定座標(無理ならその近くの安全な地上)へ
+boot();
+</script>
+</body>
+</html>
