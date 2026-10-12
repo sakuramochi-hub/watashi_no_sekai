@@ -109,8 +109,9 @@ document.addEventListener('keydown', event => {
 <script>
 // ================= データ定義 =================
 // ブロック追加は BLOCKS に1行足すだけ。tex は TEXTURES の名前。all か top/side/bottom で面ごとに指定できる。
-//   name: 表示名(日本語。省略時はキー名) / solid: 当たり判定あり / opaque: 隣接面を隠す(葉・ガラス等は false) / placeable: ホットバーに入れられる / blocksLight: 光を遮る(省略時は opaque と同じ)
+//   name: 表示名(日本語。省略時はキー名) / solid: 当たり判定あり / opaque: 隣接面を隠す / placeable: ホットバー用 / blocksLight: 光を遮る(省略時は opaque と同じ) / emission: 発光レベル(1〜15、省略=0)
 //   透明テクスチャの扱い: render 省略=切り抜き(アルファ0.5未満のピクセルは描かない。葉・植物向け) / render:'translucent'=半透明(アルファ通りに blend。水・ガラス向け)
+//   流体の照明: fluid.lighting.ambientLevel = その流体に触れた面の最低環境光(0〜15)。fluid.camera は水中の画面色とフォグを定義する。
 //   cull:'same' = 同じブロック同士が接する面を描かない(ガラス向け。省略時は opaque なブロックにだけ隠される=葉は内側の面も描いて奥行きが出る)
 //   重力: gravity:true = 真下に支え(固体)が無いと落下する(砂・砂利)。落下中は MOB falling_block に置き換わり、着地でブロックに戻る。
 //   向き: orient:'axis' = 設置した面の向きに合わせて X/Y/Z 軸の3方向に置けるブロック(原木など)。tex は {end:軸に垂直な面(切り口), side:それ以外(木目は軸方向に通る)} で指定する。
@@ -132,10 +133,11 @@ const BLOCKS={
   bean_2:{id:13,name:'豆の株',solid:false,opaque:false,shape:'cross',fluidBreaks:true,tex:{all:'bean_2'},plant:{next:'bean_3',avg:30}},
   bean_3:{id:14,name:'実った豆の株',solid:false,opaque:false,shape:'cross',fluidBreaks:true,tex:{all:'bean_3'},plant:{harvest:{to:'bean_1',give:'bean'}}},
   // 流体: render:'translucent'=半透明メッシュ / fluid=泳ぎ・流れのデータ / targetable:false=レイが貫通 / replaceable=設置で置き換え可 / fluidBreaks=流れに壊される
-  water:{id:15,name:'水',solid:false,opaque:false,render:'translucent',tex:{all:'water'},targetable:false,replaceable:true,blocksLight:true,
+  water:{id:15,name:'水',solid:false,opaque:false,render:'translucent',tex:{all:'water'},targetable:false,replaceable:true,blocksLight:false,
     fluid:{kind:'water',surface:14/16,
       physics:{gravity:3,fall:4,speed:.7,accel:.6,swimUp:4.5,climb:5.5,drag:2.5},
-      camera:{tint:'rgba(30,80,200,.35)',fog:{color:'#1f4fa8',near:.5,far:20}},
+      lighting:{ambientLevel:11},   // 水中の環境光(0〜15)。天空光の減衰とは別に、視界の暗さを抑える
+      camera:{tint:'rgba(55,165,220,.22)',fog:{color:'#72d5e8',near:16,far:68}},
       flow:{spread:7,tickMs:250,infiniteSource:true}}},
   sand:{id:16,name:'砂',gravity:true,solid:true,opaque:true,placeable:true,tex:{all:'sand'}},
   gravel:{id:17,name:'砂利',gravity:true,solid:true,opaque:true,placeable:true,tex:{all:'gravel'}},
@@ -152,6 +154,12 @@ for(const [n,b] of Object.entries(BLOCKS))if(b.orient==='axis'){
   for(const a of ['x','z'])BLOCKS[n+'_'+a]={...b,id:nid++,axis:a,placeable:false};   // 設置は元ブロックから。壊したときの見た目などは元と同じ
 }
 if(nid>256)throw new Error('ブロックIDが256個を超えました(チャンクは1バイト/ブロック)');}
+// 発光・設置方向を持つブロック。既存ブロックID(27〜30)を維持するため、軸バリアント生成後に登録する。
+BLOCKS.torch={id:Math.max(...Object.values(BLOCKS).map(b=>b.id))+1,name:'松明',solid:false,opaque:false,blocksLight:false,fluidBreaks:true,placeable:true,shape:'torch',orient:'mount',mount:'floor',emission:14,tex:{all:'torch'}};
+{const b=BLOCKS.torch;b.base='torch';let nid=Math.max(...Object.values(BLOCKS).map(b=>b.id))+1;
+  for(const m of ['xp','xn','zp','zn'])BLOCKS['torch_'+m]={...b,id:nid++,mount:m,placeable:false};
+  if(nid>256)throw new Error('ブロックIDが256個を超えました(チャンクは1バイト/ブロック)');
+}
 // アイテム(ブロックではないもの)。plants: 地面に使うと置かれるブロック / on: 置ける地面
 const ITEMS={bean:{id:1000,name:'豆',tex:'bean_item',plants:'bean_0',on:['grass','dirt']}};
 // ================= テクスチャ定義 =================
@@ -166,7 +174,7 @@ const ITEMS={bean:{id:1000,name:'豆',tex:'bean_item',plants:'bean_0',on:['grass
 //   ['erasepix',[[x,y],...]]           指定ピクセルを透明に戻す
 //   ['alpha',倍率]                     これまでに描いた全ピクセルの不透明度に倍率(0〜1)を掛ける(ガラス・水の半透明化)
 //   ['frame',色,太さ,noise]            タイルの外周に枠を描く(ガラスの縁など)
-//   ['leaves',基本色,濃い色,明るい色,穴の割合]   葉っぱ専用: 葉の模様を描き、隙間を透明にくり抜く(穴の割合は 0〜0.5 目安、省略時 .22。シードはテクスチャ名で固定)
+//   ['leaves',基本色,濃い色,明るい色,最小サイズ,最大サイズ,隙間,層の数,仕上げの葉の数]   葉っぱ専用: 葉を1枚ずつ、ランダムな大きさ・向きで描く。同じ層の葉の間には隙間(px)を空け、層を奥から重ねて奥行きを出す(サイズは葉の半分の長さ[px] 目安1.2〜3.1。最後に空いた穴を狙って明るい葉を重ねる。シードはテクスチャ名で固定)
 const TEXTURES={
   missing:   [['rect',0,0,16,16,'#101010'],['rect',0,0,8,8,'#f000f0'],['rect',8,8,8,8,'#f000f0']],   // 未知ブロックの目印
   stone:     [['fill','#7f7f7f',.08],['dots','#6a6a6a',11],['dots','#939393',07]],
@@ -179,18 +187,21 @@ const TEXTURES={
   log_top:   [['rect',0,0,16,16,'#54463a',.05],['rect',1,1,14,14,'#c2a270',.05],['rect',3,3,10,10,'#94774a',.05],['rect',4,4,8,8,'#c2a270',.05],['rect',6,6,4,4,'#94774a',.05],['rect',7,7,2,2,'#c2a270',.05]],
   birch_side:  [['fill','#ebe8e4',.05],['vdots','#d1cec9',5,2]],
   birch_top:   [['rect',0,0,16,16,'#ebe8e4',.05],['rect',1,1,14,14,'#ffe1b3',.05],['rect',3,3,10,10,'#e0c496',.05],['rect',4,4,8,8,'#ffe1b3',.05],['rect',6,6,4,4,'#e0c496',.05],['rect',7,7,2,2,'#ffe1b3',.05]],
-  leaves:    [['leaves','#A8A8A8','#919191','#B1B1B1',.22]],
+  leaves:    [['leaves','#A8A8A8','#6E6E6E','#D2D2D2',1.2,3.1,1,2,3]],
   tree_lod:  [['fill','#A8A8A8',.05],['dots','#919191',18],['dots','#B1B1B1',12]], // 遠景木LOD専用: 通常の葉と同じくバイオーム色を掛ける中立色
   bedrock:   [['fill','#3c3c3c',.15],['dots','#1e1e1e',40],['dots','#5a5a5a',30]],
   brick:   [['fill','#82421f',.05],['rect',0,3,16,1,'#bdada4',.05],['rect',0,7,16,1,'#bdada4',.05],['rect',0,11,16,1,'#bdada4',.05],['rect',0,15,16,1,'#bdada4',.05],['rect',0,0,1,3,'#bdada4',.05],['rect',8,0,1,3,'#bdada4',.05],['rect',0,8,1,3,'#bdada4',.05],['rect',8,8,1,3,'#bdada4',.05],['rect',3,4,1,3,'#bdada4',.05],['rect',11,4,1,3,'#bdada4',.05],['rect',3,12,1,3,'#bdada4',.05],['rect',11,12,1,3,'#bdada4',.05]],
   stone_brick:   [['fill','#7f7f7f',.05],['rect',0,3,16,1,'#636363',.05],['rect',0,7,16,1,'#636363',.05],['rect',0,11,16,1,'#636363',.05],['rect',0,15,16,1,'#636363',.05],['rect',0,0,1,3,'#636363',.05],['rect',8,0,1,3,'#636363',.05],['rect',0,8,1,3,'#636363',.05],['rect',8,8,1,3,'#636363',.05],['rect',3,4,1,3,'#636363',.05],['rect',11,4,1,3,'#636363',.05],['rect',3,12,1,3,'#636363',.05],['rect',11,12,1,3,'#636363',.05]],
   oak_planks:   [['fill','#c2a270',.05],['rect',0,3,16,1,'#8c7651',.05],['rect',0,7,16,1,'#8c7651',.05],['rect',0,11,16,1,'#8c7651',.05],['rect',0,15,16,1,'#8c7651',.05]],
-  water:     [['fill','#2f5fd0',.05],['dots','#4a7be8',20],['dots','#2450b0',14],['alpha',.72]],   // 半透明はテクスチャ側のアルファで表現(マテリアルは固定の透明度を持たない)
+  water:     [['fill','#b8e3e0',.035],['dots','#d5f5e9',20],['dots','#8bc9cb',14],['alpha',.54]],   // 明るい低彩度の水色を基調にし、透明度は維持したままバイオーム色を反映
   sand:      [['fill','#dbd3a0',.05],['dots','#cfc690',16],['dots','#e6dfb4',10]],
   sandstone_top:[['fill','#dbd3a0',.04],['dots','#d2c994',10]],
   sandstone: [['fill','#d6c98f',.05],['rect',0,0,16,1,'#e3d9a8'],['rect',0,5,16,1,'#c9bc82'],['rect',0,10,16,1,'#c9bc82'],['dots','#c4b77c',10]],
   gravel:    [['fill','#857f7b',.12],['dots','#6b6663',24],['dots','#a09a96',16]],
-  glass:     [['fill','#cfe9f2',.03],['alpha',.18],['frame','#e8f6fb',1,.03],['pix','#ffffffd0',[[2,2],[3,3],[4,4],[2,4],[3,5]]]]
+  glass:     [['fill','#cfe9f2',.03],['alpha',.18],['frame','#e8f6fb',1,.03],['pix','#ffffffd0',[[2,2],[3,3],[4,4],[2,4],[3,5]]]],
+  // 松明: モデル用の配置(x=7〜8 の 2px 幅 × y=6〜15 の 10px)。上2行が炎(上面にも使う)、その下が樹脂を塗った頭、麻紐を巻いた木の棒。
+  //   左列(x=7)が明るい面、右列(x=8)が影の面。ブロックモデルが側面に 2x10、上面に炎の 2x2(y=6〜7)、底面に 2x2(y=13〜14)を貼る。
+  torch:     [['rows',7,6,'ab/cd/ef/gh/ij/kl/mn/ij/kp/qr',{a:'#ffb02e',b:'#ff6a1a',c:'#ffe9a0',d:'#ffc84a',e:'#5a3d2c',f:'#3c281e',g:'#6e4a33',h:'#46301f',i:'#d9c79a',j:'#a8956a',k:'#9a7552',l:'#6d4e36',m:'#8c6948',n:'#62452f',p:'#62452f',q:'#7a5a3e',r:'#553b28'}]]
 };
 // ================= 豆・MOB のデータ =================
 // MOBS: parts は {size:[w,h,d](px,16px=1ブロック), at:[x,y,z](親の原点からの位置=回転軸), off:[x,y,z](箱を軸からずらす量), parent, color か tex:{面:テクスチャ名}}
@@ -230,6 +241,7 @@ const MOBS={
     armR:{parent:'body',size:[1.6,6,1.8],at:[3.55,2.2,0],off:[0,-2.5,0],color:'#ffe3cf'},
     head:{parent:'body',size:[8,7.5,8],at:[0,3,0],off:[0,3.75,0],color:'#7b4b2a'}},
    anim:{walk:{legL:{x:[0,.7,9]},legR:{x:[0,-.7,9]},armL:{x:[0,-.6,9]},armR:{x:[0,.6,9]}},
+    talk:{head:{x:[0,.10,7.5]},armL:{x:[.92,.19,8],z:[-.04,.035,7.6]},armR:{x:[.94,.17,8.35],z:[.04,.03,7.9]},body:{y:[0,.025,5.2]}},
     hang:{armL:{z:[-2.6,-.15,6]},armR:{z:[2.6,.15,6]},legL:{x:[0,.3,5]},legR:{x:[0,-.3,5]}}},
    variants:{
     boy:{lines:['ハトさんに連れてきてもらったよ!','ぼく、空を飛んできたんだ!'],parts:{
@@ -246,18 +258,89 @@ const MOBS={
   // 落下中の重力ブロック。1ブロック大の箱(ブロックのメッシュと重なっても面がちらつかないよう僅かに大きい)。見た目は variants(ブロックごと・自動生成)
   falling_block:{r:.5,h:1,yaw:0,parts:{body:{size:[16.1,16.1,16.1],at:[0,8,0],color:'#ffffff'}}}
 };
-// 挙動データ: goals は優先度順で [ゴール名,パラメータ]、最初に true を返したものがそのtickを担当(GOALS 参照)
-//   interact: マウスボタン → {holding,wild,states,consume,set,hop,say,toast} / spawn: 自然湧き / persist: 保存する / home: 出現地点を拠点にする
-// errand: 'eat' 後に飛び去り、delay 秒後に cargo を吊るして戻ってくる(dist: 戻ってくる距離 / hang: 吊るす長さ)
-Object.assign(MOBS.pigeon,{errand:{delay:[40,90],dist:56,hang:1.35,cargo:{type:'villager',variants:['boy','girl']},toast:'遠くから羽音が聞こえる…'},air:true,idle:'peck',persist:false,
-  goals:[['bring'],['leave'],['eat'],['approach',{item:'bean',within:6,speed:1.5}],['wander',{speed:.9}]],
+// ================= MOB の挙動(behavior)データ =================
+// 見た目(MOBS の parts/anim/variants)と挙動(behavior)を分離。MOBS[種類].behavior に「何をするか」をすべてデータで書く。
+// コード側は GOALS(行動部品)と mobs(それを動かす仕組み)だけで、MOBの種類名・ブロック名・秒数・速度は一切持たない。
+//   新しいMOB = MOBS に見た目を足し、behavior:{extends:'walker', goals:[...], ...} を書くだけ。
+//
+// behavior のキー(省略した項目は BEHAVIOR_DEFAULTS → extends したプリセット → 自分の記述 の順で上書きされる。オブジェクトは再帰マージ、配列は丸ごと置換):
+//   extends : BEHAVIORS のプリセット名(文字列 or 配列。後ろが優先)
+//   flags   : persist(保存する) / home(出現地点を拠点にする) / always(遠くでも毎フレーム更新) / noPush(プレイヤーに押されない)
+//             noAim(照準の対象にしない) / headTurn(頭を look 方向へ向ける) / air(浮いたら anim.air の姿勢) / keepSpot(復帰時に位置を補正しない)
+//   physics : gravity / fall(最大落下速度) / buoyUp・buoyDown(水中の上下の減衰) / jump(段差・脱出ジャンプの初速) / climbCooldown(段差登りの間隔)
+//             jumpCooldown(脱出経路でのジャンプ間隔) / pushRadius(プレイヤーに押し出される距離)
+//   anim    : idle(止まっているときの姿勢名) / air(空中の姿勢名) / airDelay(浮いてから切り替わるまでの秒数)
+//   states  : 状態名のグループ。flying(飛行中: 描画距離・LOD・退避の対象外) / busy(日常ゴールが割り込まない) / noRescue(動けなくても脱出経路を探さない)
+//   stuck   : 動けないと判定する条件 {time,minSpeed,minMove,ratio} と、壁に当たったときの向き変更 bumpTurn
+//   lod     : dist より遠いMOBは every 回に1回だけ更新
+//   scare   : 左クリックで驚いたときの逃走 {state,hopVy,hopTime,dash:[秒],speed,turn,lureCooldown,forageDelay,afterForageDelay,afterCooldown}
+//   goals   : [ゴール名, パラメータ] を優先度順に。最初に true を返したものがそのtickを担当(パラメータの既定値は GOAL_DEFAULTS)
+//   interact: マウスボタン → {holding,wild,states,unless,consume,set,hop,say,toast,scare}
+//   spawn   : 自然湧き {on,group,cap,ring,despawn}
+//   errand  : 'eat' 後に飛び去り、delay 秒後に cargo を吊るして戻ってくる {delay,dist,hang,altitude,retry,state,cargo,toast}
+// 範囲 [最小,最大] の値は乱数で決まる。
+const BEHAVIOR_DEFAULTS={
+  flags:{persist:false,home:false,always:false,noPush:false,noAim:false,headTurn:false,air:false,keepSpot:false},
+  physics:{gravity:22,fall:30,buoyUp:22,buoyDown:10,jump:8.5,climbCooldown:.35,jumpCooldown:.72,pushRadius:.6},
+  anim:{idle:'idle',air:'fly',airDelay:.15},
+  states:{flying:[],busy:[],noRescue:[]},
+  stuck:{time:.65,minSpeed:.2,minMove:.003,ratio:.16,bumpTurn:1.15},
+  lod:{dist:32,every:4},
+  scare:{state:'scared',hopVy:8.5,hopTime:.22,dash:[1.8,2.3],speed:4.8,turn:10,lureCooldown:[5,8],forageDelay:[7,11],afterForageDelay:[6,10],afterCooldown:.35},
+  goals:[],interact:{},spawn:null,errand:null
+};
+// ゴールごとのパラメータ既定値(behavior.goals の [名前,{...}] で上書き)
+const GOAL_DEFAULTS={
+  carried:{},
+  lookAt:{within:6,maxLook:1,relax:.9},                                   // within: 見る距離 / maxLook: 首の最大角 / relax: 離れたときに正面へ戻る係数
+  leave:{state:'leave',speed:6.5,climb:3.2,despawn:54},                   // state の間、向いた方向へ飛び去り despawn ブロック離れたら消える
+  bring:{state:'bring',speed:9,descend:2.4,cruise:10,altRate:3,arrive:.18}, // errand の積み荷を着地点へ運ぶ(cruise: 着地点の上空の高さ)
+  eat:{state:'eat',next:'leave'},                                         // state の間ついばみ、終わったら next 状態へ(errand があれば予約)
+  scared:{},                                                              // 数値は behavior.scare
+  waterEscape:{radius:10,speed:1.8,wanderSpeed:1.1,turn:4.5,fallbackTurn:2.6},
+  recover:{radius:8,speed:1.2,turn:7,maxRise:1.08,retry:.85},             // 詰まった・穴に落ちたときの脱出(逃走時は behavior.scare の speed/turn)
+  approachPlayer:{lure:null,within:8,speed:1.5,turn:5.5,retarget:.55,arrive:.48},   // lure: プレイヤーが手に持つとついてくるブロック名
+  forage:{target:null,into:null,radius:8,speed:1.45,reach:.85,keep:1.05,turn:6,    // target ブロックを探して食べ、into に変える
+    eat:[1.25,1.7],search:[3,7.5],failDelay:[4,7],doneDelay:[2,5]},
+  social:{with:'self',within:8,keep:7,reach:1.45,speed:.8,turn:6,talk:[2.8,4],search:[4,11],chance:.7,rest:[8,16]},   // with: 話し相手のMOB種類の配列('self'=同種)
+  wander:{speed:1,faceTurn:5,walkTurn:4,walk:[.8,2.2],idle:[.6,1.8],homeRadius:10},   // homeRadius: 拠点(flags.home)からこれ以上離れたら戻る
+  fall:{gravity:20,terminal:40,linger:.25}                                // 重力ブロックの落下(linger: 着地後に残す秒数)
+};
+// 再利用できる挙動のプリセット。MOBS[*].behavior.extends で選ぶ。
+const BEHAVIORS={
+  walker:{goals:[['waterEscape'],['recover'],['wander']]},                // 地上を歩く基本の生き物: 水から上がり、詰まったら脱出し、うろうろする
+  gravityBlock:{flags:{persist:true,always:true,noPush:true,noAim:true,keepSpot:true},goals:[['fall']]}   // persist=保存する(落下中に保存しても砂が消えない) / always=すり抜け防止で毎フレーム更新
+};
+const isPlain=v=>v&&typeof v==='object'&&!Array.isArray(v);
+const mergeB=(a,b)=>{const o={...a};for(const k in b)o[k]=isPlain(a[k])&&isPlain(b[k])?mergeB(a[k],b[k]):(isPlain(b[k])?mergeB({},b[k]):b[k]);return o};
+function resolveBehavior(b,name,depth=0){   // extends を辿って BEHAVIOR_DEFAULTS に重ね、ゴールの既定パラメータを埋める
+  if(depth>8)throw new Error('behavior の extends が循環しています: '+name);
+  let r=mergeB({},BEHAVIOR_DEFAULTS);
+  for(const e of [].concat(b.extends||[])){
+    if(!BEHAVIORS[e])throw new Error(`MOBS.${name}: 未知の behavior プリセット '${e}'`);
+    r=mergeB(r,resolveBehavior(BEHAVIORS[e],e,depth+1));
+  }
+  const {extends:_,...own}=b;r=mergeB(r,own);
+  r.goals=r.goals.map(([g,o])=>[g,{...GOAL_DEFAULTS[g],...o}]);
+  r.params={};for(const [g,o] of r.goals)if(!r.params[g])r.params[g]=o;   // ゴール名 → パラメータ(他のコードから引く用)
+  return r;
+}
+
+MOBS.pigeon.behavior={extends:'walker',
+  flags:{air:true},
+  states:{flying:['leave','bring'],busy:['eat','leave','bring','scared'],noRescue:['scared','eat','forageEat']},
+  goals:[['bring'],['leave'],['eat'],['scared'],['waterEscape'],['recover'],
+    ['approachPlayer',{lure:'bean',within:8,speed:1.5}],['forage',{target:'bean_3',into:'bean_1'}],['wander',{speed:.9}]],
   spawn:{on:['grass'],group:[2,4],cap:8,ring:[16,36],despawn:64},
-  interact:{2:{holding:'bean',states:['idle','walk'],consume:true,set:{st:'eat',t:1.2,wild:false},toast:'鳩が豆をついばんでいる…'},0:{hop:4}}});
-// falling_block: persist=保存する(落下中に保存しても砂が消えない) / always=遠くでも毎フレーム更新(すり抜け防止) / noPush=プレイヤーに押し出されない / noAim=照準の対象にしない
-Object.assign(MOBS.falling_block,{persist:true,always:true,noPush:true,noAim:true,goals:[['fall',{gravity:20,terminal:40}]]});
-Object.assign(MOBS.villager,{persist:true,home:true,headTurn:true,
-  goals:[['carried'],['lookAt',{within:6}],['wander',{speed:1}]],
-  interact:{2:{say:true},0:{hop:5,toast:'わっ!'},1:{hop:5,toast:'わっ!'}}});
+  interact:{2:{holding:'bean',states:['idle','walk'],consume:true,set:{st:'eat',t:1.2,wild:false},toast:'鳩が豆をついばんでいる…'},
+    0:{scare:true,unless:['leave','bring','scared']}},
+  errand:{delay:[40,90],dist:56,hang:1.35,altitude:14,retry:[3,5],state:'bring',cargo:{type:'villager',variants:['boy','girl']},toast:'遠くから羽音が聞こえる…'}};
+MOBS.villager.behavior={extends:'walker',
+  flags:{persist:true,home:true,headTurn:true},
+  goals:[['carried'],['waterEscape'],['recover'],['social',{with:['villager']}],['lookAt',{within:6}],['wander',{speed:1}]],
+  interact:{2:{say:true},0:{hop:5,toast:'わっ!'},1:{hop:5,toast:'わっ!'}}};
+MOBS.falling_block.behavior={extends:'gravityBlock',goals:[['fall',{gravity:20,terminal:40}]]};
+for(const [n,d] of Object.entries(MOBS))d.behavior=resolveBehavior(d.behavior||{extends:'walker'},n);
 for(const c of new Set(JSON.stringify(MOBS).match(/#[0-9a-f]{6}/gi)||[]))TEXTURES[c]=[['fill',c,.04]];   // 単色パーツ用タイル
 const CONFIG={
   world:{chunks:16,height:256,infinite:true},                       // infinite: true で560兆(2^49)ブロックの超巨大ワールド対応
@@ -268,7 +351,7 @@ const CONFIG={
   // 描画負荷(内蔵GPU向け)。pixelRatio: 描画解像度の上限(1=画面ピクセル等倍) / adaptive: 重いと自動で解像度を下げる(下限 minPixelRatio)
   render:{pixelRatio:1,minPixelRatio:.5,adaptive:true,maxFps:60,antialias:false},
   hotbarSize:9,
-  hotbar:['stone','grass','dirt','log','leaves','bean'],                           // 初期のホットバー内容(実行中は E キーで変更)
+  hotbar:['stone','grass','dirt','log','leaves','bean','torch'],                    // 初期のホットバー内容(実行中は E キーで変更)
   startSlot:1,
   seed:null,   // null = 起動ごとにランダム。固定すれば同じワールドを再現できる
   // 読み込み範囲(チャンク単位)。renderDistance*16 がフォグ終端(48)より外なら見た目は変わらない
@@ -278,8 +361,10 @@ const CONFIG={
     inboxMax:24,         // ワーカーから届いて未反映の結果がこれ以上溜まったら、新しい要求を止める(反映が追いつくまで待つ)
     maxInFlight:6,       // ワーカーへ同時に投げるチャンク要求の数(多いほど速く埋まるが、遠いチャンクの無駄が増える)
     meshBudgetMs:4,meshPerFrame:3},     // 1フレームでワーカーの結果を反映する時間の上限(ms)。生成・メッシュ化そのものはワーカー側
-  // Classic(rd-132211)のライティング: 柱ごとの高さマップで明/暗の2段階 × 面の向きによる固定シェード
-  lighting:{lit:1.0,dark:.7,faces:{top:1.0,bottom:.5,x:.6,z:.8}},
+  // 天空光: 0〜15のレベルを空気中へ伝播。光レベルによる暗さと、面向きの固定シェード/AOは別々に計算する。
+  // smooth: 1=スムースライティング(頂点ごとに周囲の光レベルを補間 + 角の遮蔽) / 0=面ごとに単色
+  // ao: スムース時、不透明ブロックに塞がれた周囲サンプルの明るさ(小さいほど角が暗い)
+  lighting:{lit:1.0,faces:{top:1.0,bottom:.5,x:.6,z:.8},smooth:1,ao:.25},
   player:{speed:6,sprint:1.5,acceleration:32,airAcceleration:14,friction:24,gravity:22,jumpPower:8,
     eyeHeight:1.7,height:1.8,radius:.35,mouseSensitivity:.0022,reach:6}
 };
@@ -452,53 +537,65 @@ const STRUCTURES={
 // 関数を含まない純データ(Worker へそのまま渡す)。気候ノイズは整数scaleの格子 → 巨大座標でも正確。
 //  climate: c=大陸度(-1深海〜+1内陸) t=気温 h=湿度 ridge=川(|ridge|が小さい線が川)。gain で -1〜1 に正規化
 //  baseCurve/ampCurve: 大陸度 → 基準高さ / 起伏の倍率(折れ線)。海面より低ければ水で満たされる
-//  river: width=川床の幅 bankWidth=土手の幅(ノイズ単位) depth=川床の深さ bankHeight=土手の高さ(海面基準) cRange=川が現れる大陸度
+//  river: width=川床の基準幅 / bankWidth=河岸のなだらかな肩幅(ノイズ単位) / depth=基準水深
+//         bankHeight=河岸上端の高さ(海面基準) / cRange=川筋が通る大陸度の範囲。下端を海側まで伸ばして河口を接続する。
+//         coastalWiden=海岸付近で河口を広げる割合。川筋はノイズ場から決定し、地形を後から削るのではなく断面を滑らかに馴染ませる。
 const WORLDGEN={
-  seaLevel:62, oceanThreshold:-.25,
+  seaLevel:62, oceanThreshold:-.25, coastThreshold:-.06,
   climate:{c:{scale:512,octaves:3,salt:201,gain:1.5},t:{scale:768,octaves:2,salt:202,gain:1.5},
            h:{scale:640,octaves:2,salt:203,gain:1.5},ridge:{scale:384,octaves:3,salt:204,gain:1.5}},
   baseCurve:[[-1,22],[-.6,30],[-.25,56],[-.1,64],[.1,68],[.3,72],[1,86]],
   ampCurve:[[-1,.15],[-.25,.3],[0,.7],[.3,1],[1,1.3]],
-  river:{width:.05,bankWidth:.07,depth:10,bankHeight:0,cRange:[-.2,.55]}
+  river:{width:.048,bankWidth:.105,depth:8,bankHeight:1,cRange:[-.35,.55],coastalWiden:.7}
 };
-// BIOMES: domain('ocean'|'land'|'river') / climate(理想点。ドメイン内で最も近いものが選ばれる) / terrain{offset,amp}(境界でブレンド)
+// BIOMES: domain('ocean'|'coast'|'land'|'river') / climate(理想点。ドメイン内で最も近いものが選ばれる) / terrain{offset,amp}(境界でブレンド)
 //   river: その陸バイオームで川になるときの川バイオーム名 / structures: 構造物名→生成確率(無ければ STRUCTURES.spawn.chance)
 //   surface: 上から順に評価し最初に合う規則を使う。when: aboveSea[min,max](地表Y-海面) / y[min,max] / patch{scale,min}(ノイズの斑)
-const LAND_SURFACE=[{when:{aboveSea:[-99,-1]},layers:[{block:'sand',depth:3},{block:'stone'}]},   // 水中と浜辺
+const LAND_SURFACE=[{when:{aboveSea:[-99,-1]},layers:[{block:'gravel',depth:3},{block:'stone'}]},   // 水中と浜辺
   {layers:[{block:'grass',depth:1},{block:'dirt',depth:3},{block:'stone'}]}];
 // 地層(surface): 地表から下へ向かう層のリスト。バイオームごとに surface:[...] で自由に指定できる(省略不可)。
 //   layers: [{block:ブロック名, depth:厚さ(省略=無限)}, ...] / when を付けると条件付き(上から順に最初に合うものを採用)
 const DESERT_SURFACE=[{layers:[{block:'sand',depth:4},{block:'sandstone',depth:8},{block:'stone'}]}];   // 砂4 → 砂岩8 → 石
 const BIOMES={
-  plains:{label:'平原',domain:'land',climate:{c:.35,t:0,h:-.2},terrain:{offset:3,amp:.4},river:'river',surface:LAND_SURFACE,
+  plains:{label:'平原',domain:'land',climate:{c:.35,t:0,h:-.2},terrain:{offset:3,amp:.4},river:'river',riverBed:'gravel',surface:LAND_SURFACE,
+    waterTint:'#7DAECF',waterDeepTint:'#477BA9', // 澄んだ青。深い場所ほど青みが増す
     foliageTint:'#91BD59', // 明るい黄緑
     structures:{oak:0,birch:0,smallTree:0,beanPatch:.0012}},
-  desert:{label:'砂漠',domain:'land',climate:{c:.35,t:.5,h:0},terrain:{offset:3,amp:.6},river:'river',surface:DESERT_SURFACE,
+  desert:{label:'砂漠',domain:'land',climate:{c:.35,t:.5,h:0},terrain:{offset:3,amp:.6},river:'river',riverBed:'sand',surface:DESERT_SURFACE,
+    waterTint:'#91C8D2',waterDeepTint:'#477F9A', // 砂地に映える明るい青緑
     foliageTint:'#BFB755',
     structures:{oak:0,birch:0,smallTree:0,beanPatch:0}},
-  forest:{label:'森',domain:'land',climate:{c:.4,t:.1,h:.6},terrain:{offset:4,amp:.8},river:'river',surface:LAND_SURFACE,
+  forest:{label:'森',domain:'land',climate:{c:.4,t:.1,h:.6},terrain:{offset:4,amp:.8},river:'river',riverBed:'gravel',surface:LAND_SURFACE,
+    waterTint:'#79BBA9',waterDeepTint:'#376E75', // 森の影では少し深い青緑
     foliageTint:'#79C05A', // 深い緑
     structures:{oak:.024,birch:.024,smallTree:.004,beanPatch:.0006}},
-  ocean:{label:'海',domain:'ocean',climate:{c:-.4,t:0,h:0},foliageTint:'#88dd44',surface:[
+  beach:{label:'砂浜',domain:'coast',climate:{c:-.15,t:0,h:0},terrain:{offset:2,amp:.25},river:'river',riverBed:'sand',
+    waterTint:'#83BBD2',waterDeepTint:'#477BA9',foliageTint:'#91BD59',
+    surface:[{layers:[{block:'sand',depth:4},{block:'sandstone',depth:8},{block:'stone'}]}]},
+  ocean:{label:'海',domain:'ocean',climate:{c:-.4,t:0,h:0},waterTint:'#719FCB',waterDeepTint:'#416FA8',foliageTint:'#88dd44',surface:[
     {when:{aboveSea:[-99,-1],patch:{scale:24,min:.3}},layers:[{block:'gravel',depth:3},{block:'stone'}]},
     {layers:[{block:'sand',depth:3},{block:'stone'}]}]},
-  deep_ocean:{label:'深海',domain:'ocean',climate:{c:-.7,t:0,h:0},waterTint:'#9fb4ff',foliageTint:'#66cc44',surface:[{layers:[{block:'gravel',depth:3},{block:'stone'}]}]},
-  river:{label:'川',domain:'river',waterTint:'#8cc8ff',foliageTint:'#77ee55',surface:[{layers:[{block:'sand',depth:2},{block:'gravel',depth:2},{block:'stone'}]}]}
+  deep_ocean:{label:'深海',domain:'ocean',climate:{c:-.7,t:0,h:0},waterTint:'#477BAC',waterDeepTint:'#24456D',foliageTint:'#66cc44',surface:[{layers:[{block:'gravel',depth:3},{block:'stone'}]}]},
+  river:{label:'川',domain:'river',waterTint:'#B9F0D8',waterDeepTint:'#72BEB5', // 浅瀬は明るいミント、深みは澄んだ翡翠色
+    foliageTint:'#77ee55',surface:[{layers:[{block:'sand',depth:2},{block:'gravel',depth:2},{block:'stone'}]}]}
 };
 const CN=CONFIG.world.chunks, W=CN*16, H=CONFIG.world.height;
 
 // データから高速参照用テーブルを生成
-const ID={},CROSS=new Uint8Array(256),SOLID=new Uint8Array(256),OPAQUE=new Uint8Array(256),CULL=new Uint8Array(256),LIGHTBLOCK=new Uint8Array(256),FACE_TEX=[];
-const BASE_OF=new Uint8Array(256),VARIANT=[],GRAV=new Uint8Array(256);   // GRAV: 重力ブロックか   // BASE_OF: 向き違いバリアント→元のブロックID(それ以外は自分自身) / VARIANT[元ID]={x,y,z: 各軸向きのID}
-const TRANS=new Uint8Array(256),REPL=new Uint8Array(256),TARG=new Uint8Array(256),FB=new Uint8Array(256),FK=new Uint8Array(256),LV=new Uint8Array(256),FLUIDH=new Float32Array(256);
+const ID={},CROSS=new Uint8Array(256),TORCH=new Uint8Array(256),MOUNT=new Uint8Array(256),EMISSION=new Uint8Array(256),SOLID=new Uint8Array(256),OPAQUE=new Uint8Array(256),CULL=new Uint8Array(256),LIGHTBLOCK=new Uint8Array(256),FACE_TEX=[];
+const MOUNT_CODE={floor:1,xp:2,xn:3,zp:4,zn:5};
+const BASE_OF=new Uint8Array(256),VARIANT=[],GRAV=new Uint8Array(256);   // GRAV: 重力ブロックか / VARIANT[元ID]:向きごとのブロックID
+const TRANS=new Uint8Array(256),REPL=new Uint8Array(256),TARG=new Uint8Array(256),FB=new Uint8Array(256),FK=new Uint8Array(256),LV=new Uint8Array(256),FLUIDH=new Float32Array(256),FLUIDMINLIGHT=new Uint8Array(256);
 const FKN=[null],FIDS={},FPHYS=[],FCAM=[],BLK=[];   // FK: 流体の種類番号 / LV: 流れレベル(水源=最大) / FIDS: 種類→[レベル→ID]
 for(const [name,b] of Object.entries(BLOCKS)){
   BLK[b.id]=b;TRANS[b.id]=b.render==='translucent'?1:0;REPL[b.id]=(b.id===0||b.replaceable)?1:0;TARG[b.id]=b.id&&b.targetable!==false?1:0;FB[b.id]=b.fluidBreaks?1:0;
   if(b.fluid){const f=b.fluid;let k=FKN.indexOf(f.kind);if(k<0)k=FKN.push(f.kind)-1;FK[b.id]=k;LV[b.id]=f.level||f.flow.spread+1;(FIDS[f.kind]=FIDS[f.kind]||[])[LV[b.id]]=b.id;
-    FLUIDH[b.id]=f.surface*LV[b.id]/(f.flow.spread+1);FPHYS[b.id]=f.physics;FCAM[b.id]=f.camera}
-  ID[name]=b.id;CROSS[b.id]=b.shape==='cross'?1:0;SOLID[b.id]=b.solid?1:0;OPAQUE[b.id]=b.opaque?1:0;CULL[b.id]=b.cull==='same'?1:0;LIGHTBLOCK[b.id]=(b.blocksLight??b.opaque)?1:0;
+    FLUIDH[b.id]=f.surface*LV[b.id]/(f.flow.spread+1);FLUIDMINLIGHT[b.id]=Math.max(0,Math.min(15,f.lighting?.ambientLevel|0));FPHYS[b.id]=f.physics;FCAM[b.id]=f.camera}
+  ID[name]=b.id;CROSS[b.id]=b.shape==='cross'?1:0;TORCH[b.id]=b.shape==='torch'?1:0;MOUNT[b.id]=MOUNT_CODE[b.mount]||0;EMISSION[b.id]=Math.max(0,Math.min(15,b.emission|0));
+  SOLID[b.id]=b.solid?1:0;OPAQUE[b.id]=b.opaque?1:0;CULL[b.id]=b.cull==='same'?1:0;LIGHTBLOCK[b.id]=(b.blocksLight??b.opaque)?1:0;
   BASE_OF[b.id]=b.base?ID[b.base]:b.id;GRAV[b.id]=b.gravity?1:0;
   if(b.orient==='axis')(VARIANT[BASE_OF[b.id]]=VARIANT[BASE_OF[b.id]]||{})[b.axis]=b.id;
+  if(b.orient==='mount')(VARIANT[BASE_OF[b.id]]=VARIANT[BASE_OF[b.id]]||{})[b.mount]=b.id;
   if(b.tex){   // FACE_TEX は代表の見た目(アイコン・パーティクル・遠景用)。横向きは上下面にも木目(side)が出る。面ごとの本当の割り当ては FACE_UV の axis/end(ワーカーのメッシュ生成)で行う
     const t=b.tex,flat=b.axis&&b.axis!=='y';
     FACE_TEX[b.id]={top:flat?t.side:(t.top||t.end||t.all),bottom:flat?t.side:(t.bottom||t.end||t.all),side:t.side||t.all};
@@ -523,6 +620,86 @@ TEX_NAMES.forEach((n,i)=>TEX_INDEX[n]=i);
 const ATLAS_ROWS=Math.ceil(TEX_NAMES.length/ATLAS_COLS);
 const hexRGB=h=>[1,3,5].map(i=>parseInt(h.slice(i,i+2),16));
 const hexRGBA=h=>[...hexRGB(h),h.length>=9?parseInt(h.slice(7,9),16):255];   // '#rrggbb' → a=255 / '#rrggbbaa'
+// 葉っぱ専用の描画: 葉を1枚ずつ(ランダムな大きさ・向き)描く。
+// 葉は「層」に分けて奥から手前へ重ねる。同じ層の中では葉と葉の間に gap ピクセルの隙間を必ず残し、
+// 奥の層ほど暗く描くことで、手前の層の隙間から暗い葉が覗いて奥行きが出る(両方の層の隙間が重なった所だけ透明になる)。
+// 最後に、まだ空いている大きめの穴を狙って明るい葉を accent 枚だけ手前に重ね、穴を細かく割る。
+// タイルは繰り返し貼られるので、座標は端で反対側へ回り込む(つなぎ目が出ない)。層の中では大きい葉から先に置き、残った隙間へ小さい葉を詰める。
+function paintLeaves(img,rnd,a){
+  const [base='#A8A8A8',dark='#6E6E6E',light='#D2D2D2',minS=1.2,maxS=3.1,gap=1,layers=2,accent=3]=a;
+  const cb=hexRGB(base),cd=hexRGB(dark),cl=hexRGB(light);
+  const wrap=v=>((v%TILE)+TILE)%TILE;
+  const mix=(p,q,t)=>[p[0]+(q[0]-p[0])*t,p[1]+(q[1]-p[1])*t,p[2]+(q[2]-p[2])*t];
+  const clamp=v=>Math.max(0,Math.min(255,v));
+  const alphaAt=(x,y)=>img.data[(wrap(y)*TILE+wrap(x))*4+3];
+  // 葉の形(中心・向き・大きさ)を作り、覆うピクセルの一覧を返す
+  const shape=(half,wid)=>{
+    const cx=rnd()*TILE,cy=rnd()*TILE,th=rnd()*Math.PI,co=Math.cos(th),si=Math.sin(th);
+    const px=[],R=Math.ceil(half)+1;
+    for(let y=Math.floor(cy)-R;y<=Math.floor(cy)+R;y++)for(let x=Math.floor(cx)-R;x<=Math.floor(cx)+R;x++){
+      const dx=x+.5-cx,dy=y+.5-cy,u=(dx*co+dy*si)/half,v=-dx*si+dy*co;
+      if(u<-1||u>1)continue;
+      const w=wid*Math.pow(1-u*u,.7);                    // 両端が尖った葉の輪郭
+      if(Math.abs(v)<=w)px.push({x,y,dx,dy,u,v,w});
+    }
+    return {px,half,wid};
+  };
+  // 葉を1枚描く。depth: 1=一番奥(暗い) 0=手前(明るい)
+  const draw=(leaf,depth,bright)=>{
+    const {px,half,wid}=leaf,tone=rnd()*2-1;
+    let body=mix(cb,cd,depth*.55);
+    body=tone<0?mix(body,cd,-tone*.55):mix(body,cl,tone*.55*(1-depth*.6));   // 葉1枚ごとの明るさのばらつき
+    if(bright)body=mix(body,cl,bright);
+    const veinLen=half>=1.9;
+    for(const p of px){
+      const X=wrap(p.x),Y=wrap(p.y),o=(Y*TILE+X)*4;
+      const over=img.data[o+3]>0;                                                // 奥の葉に重なっているピクセルか
+      let c=body.slice();
+      const lit=Math.max(-1,Math.min(1,-(p.dx+p.dy)/(half+wid)*1.1));         // 左上が明るい(葉ごとのグラデーション)
+      c=lit>0?mix(c,cl,lit*.5*(1-depth*.5)):mix(c,cd,-lit*.55);
+      const edge=Math.abs(p.v)/Math.max(p.w,.01);
+      if(edge>.78)c=mix(c,cd,over?.5:.28);                                       // 縁を締める(奥の葉と重なる縁は強く: 葉の輪郭が読める)
+      if(veinLen&&Math.abs(p.v)<.55&&p.u>-.75&&p.u<.85)c=mix(c,cd,.5);       // 葉脈(葉の長軸に沿った暗い線)
+      const nz=1+(rnd()*2-1)*.04;
+      img.data[o]=clamp(c[0]*nz);img.data[o+1]=clamp(c[1]*nz);img.data[o+2]=clamp(c[2]*nz);img.data[o+3]=255;
+    }
+  };
+  for(let layer=0;layer<layers;layer++){
+    const depth=layers>1?1-layer/(layers-1):0;
+    const occ=new Uint8Array(TILE*TILE),TRY=3000;
+    for(let k=0;k<TRY;k++){
+      const half=(maxS+(minS-maxS)*Math.pow(k/(TRY-1),.45))*(.85+rnd()*.3);   // 葉の半分の長さ(大 → 小の順に試す)
+      const leaf=shape(half,Math.max(.95,half*(.42+rnd()*.26)));
+      if(leaf.px.length<5)continue;
+      let ok=true;   // 同じ層の葉のピクセルから gap の範囲(8方向)に入るなら置けない
+      for(const p of leaf.px){
+        for(let oy=-gap;oy<=gap&&ok;oy++)for(let ox=-gap;ox<=gap;ox++)if(occ[wrap(p.y+oy)*TILE+wrap(p.x+ox)]){ok=false;break}
+        if(!ok)break;
+      }
+      if(!ok)continue;
+      for(const p of leaf.px)occ[wrap(p.y)*TILE+wrap(p.x)]=1;
+      draw(leaf,depth,0);
+    }
+  }
+  // 仕上げ: 空いている穴(透明ピクセル)をいちばん多く覆う候補を選んで、明るい葉を手前に重ねる
+  const occA=new Uint8Array(TILE*TILE);
+  for(let i=0;i<accent;i++){
+    let best=null,bestN=0;
+    for(let t=0;t<80;t++){
+      const half=(minS+.5+rnd()*(maxS-minS-.5))*.85,leaf=shape(half,Math.max(.95,half*(.42+rnd()*.26)));
+      if(leaf.px.length<5)continue;
+      let n=0,clash=false;
+      for(const p of leaf.px){
+        if(!alphaAt(p.x,p.y))n++;
+        for(let oy=-gap;oy<=gap&&!clash;oy++)for(let ox=-gap;ox<=gap;ox++)if(occA[wrap(p.y+oy)*TILE+wrap(p.x+ox)]){clash=true;break}
+      }
+      if(!clash&&n>bestN){bestN=n;best=leaf}
+    }
+    if(!best||bestN<3)break;
+    for(const p of best.px)occA[wrap(p.y)*TILE+wrap(p.x)]=1;
+    draw(best,0,.25);
+  }
+}
 function paintTexture(name,ops){
   let seed=0;for(const ch of name)seed=Math.imul(seed^ch.charCodeAt(0),16777619);
   const rnd=mulberry(seed),img=new ImageData(TILE,TILE);
@@ -544,17 +721,7 @@ function paintTexture(name,ops){
     else if(op==='erasepix'){for(const [x,y] of a[0])erase(x,y)}
     else if(op==='alpha'){for(let i=3;i<img.data.length;i+=4)img.data[i]=Math.round(img.data[i]*a[0])}
     else if(op==='frame'){const w=a[1]||1;for(let y=0;y<TILE;y++)for(let x=0;x<TILE;x++)if(x<w||y<w||x>=TILE-w||y>=TILE-w)set(x,y,a[0],a[2])}
-    else if(op==='leaves'){   // 葉専用: 基本色の下地 → 濃淡の葉の塊 → 1〜2ピクセルの小さな穴を割合に達するまで開ける
-      const [base='#488622',dark='#2e5e10',light='#62a83a',holes=.22]=a;
-      for(let y=0;y<TILE;y++)for(let x=0;x<TILE;x++)set(x,y,base,.06);
-      const blob=(col,n)=>{for(let i=0;i<n;i++){const x=rnd()*TILE|0,y=rnd()*TILE|0,h=rnd()<.5;set(x,y,col,.05);set(x+(h?1:0),y+(h?0:1),col,.05)}};
-      blob(dark,TILE*TILE*.1|0);blob(light,TILE*TILE*.07|0);
-      const target=Math.round(TILE*TILE*Math.max(0,Math.min(.6,holes)));let cleared=0,guard=0;
-      while(cleared<target&&guard++<4000){
-        const x=rnd()*TILE|0,y=rnd()*TILE|0,h=rnd()<.5;
-        for(const [px,py] of [[x,y],[x+(h?1:0),y+(h?0:1)]])if(px<TILE&&py<TILE&&img.data[(py*TILE+px)*4+3]){erase(px,py);cleared++}
-      }
-    }
+    else if(op==='leaves')paintLeaves(img,rnd,a);   // 葉専用: 葉を1枚ずつ重ねて描く(上の paintLeaves)
     else if(op==='crack'){
       const [cx,cy,col,count,len,width]=a;
       const draw=(x,y,w)=>{
@@ -691,15 +858,42 @@ FACE_TEX.forEach((f,id)=>{if(!f)return;
 const TREE_LOD_UV=uvOf('tree_lod');
 // 切り抜き(葉・植物など: 透明ピクセルを持つタイルを使う非半透明ブロック)は別メッシュ・別マテリアルで描く。それ以外はアルファテスト不要
 const CUT=new Uint8Array(256);
-function calcCut(id){const f=FACE_TEX[id];CUT[id]=!TRANS[id]&&f&&(CROSS[id]||[f.top,f.bottom,f.side].some(n=>TILE_HASA[TEX_INDEX[n]]))?1:0}
+function calcCut(id){const f=FACE_TEX[id];CUT[id]=!TRANS[id]&&f&&(CROSS[id]||TORCH[id]||[f.top,f.bottom,f.side].some(n=>TILE_HASA[TEX_INDEX[n]]))?1:0}
 for(const b of Object.values(BLOCKS))calcCut(b.id);
+// ---------- 専用の当たり判定ボックス(選択枠・レイキャスト用) ----------
+// BOX[id*6..]: セル内の [x0,y0,z0,x1,y1,z1](0〜1)。BOXP[id]=1 は立方体ではない専用判定(松明・植物など)。それ以外は 1 ブロック全体。
+//   十字形(植物): テクスチャの不透明ピクセルの範囲から高さ・幅を自動で決める(成長段階ごとに大きさが変わる)。細すぎて狙えないので幅は最低 8px。
+//   松明: ブロックモデルの角柱(メッシュ生成の TORCH 分岐と同じ寸法)を囲む箱。細すぎるので幅は最低 6px。
+const BOX=new Float32Array(256*6),BOXP=new Uint8Array(256);
+for(const b of Object.values(BLOCKS)){
+  const id=b.id,o=id*6;BOX.set([0,0,0,1,1,1],o);
+  if(CROSS[id]&&FACE_TEX[id]){
+    const dat=TILE_IMG[TEX_INDEX[FACE_TEX[id].side]].data;let x0=16,x1=-1,y0=16,y1=-1;
+    for(let y=0;y<16;y++)for(let x=0;x<16;x++)if(dat[(y*16+x)*4+3]>127){if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y}
+    if(x1>=0){
+      const half=Math.max(Math.max((x1+1)/16-.5,.5-x0/16),.25);   // 斜め2枚の板なので x・z とも中央対称の幅にする
+      BOX.set([.5-half,Math.max(0,(15-y1)/16),.5-half,.5+half,Math.min(1,(16-y0)/16),.5+half],o);BOXP[id]=1;
+    }
+  }else if(TORCH[id]){
+    const PX=1/16,L=10*PX,hw=PX,m=MOUNT[id];let bx=.5,by=0,bz=.5,dx=1,dz=0,tilt=0;
+    if(m>=2){tilt=Math.PI/8;by=3.5*PX;if(m===2){bx=1;dx=-1;dz=0}else if(m===3){bx=0;dx=1;dz=0}else if(m===4){bz=1;dx=0;dz=-1}else{bz=0;dx=0;dz=1}}
+    const st=Math.sin(tilt),ct=Math.cos(tilt),A=[dx*st,ct,dz*st],W=[-dz,0,dx],N=[dx*ct,-st,dz*ct],lo=[9,9,9],hi=[-9,-9,-9];
+    for(const sw of[-1,1])for(const sn of[-1,1])for(const h of[0,1])for(let a=0;a<3;a++){
+      const v=[bx,by,bz][a]+W[a]*sw*hw+N[a]*sn*hw+A[a]*h*L;if(v<lo[a])lo[a]=v;if(v>hi[a])hi[a]=v;
+    }
+    for(const a of[0,2]){const c=(lo[a]+hi[a])/2,hh=Math.max((hi[a]-lo[a])/2,3*PX);lo[a]=c-hh;hi[a]=c+hh}
+    const cl=v=>Math.max(0,Math.min(1,v));
+    BOX.set([cl(lo[0]),cl(lo[1]),cl(lo[2]),cl(hi[0]),cl(hi[1]),cl(hi[2])],o);BOXP[id]=1;
+  }
+}
 const BEDROCK_ID=ID.bedrock;
 // バイオーム定義 → Worker 用の数値表(ブロック名→ID、層の深さ→累積、川バイオーム名→番号)
 const BIOME_NAMES=Object.keys(BIOMES);
 const BIO=BIOME_NAMES.map(n=>{const b=BIOMES[n],chk=k=>{if(ID[k]===undefined)throw new Error(`biome ${n}: unknown block "${k}"`);return ID[k]};
   if(b.river&&!BIOMES[b.river])throw new Error(`biome ${n}: unknown river "${b.river}"`);
   return {name:n,label:b.label||n,domain:b.domain,climate:b.climate||{c:0,t:0,h:0},terrain:b.terrain||{offset:0,amp:1},river:b.river?BIOME_NAMES.indexOf(b.river):-1,
-    structs:b.structures||{},tint:b.waterTint?hexRGB(b.waterTint).map(v=>v/255):[1,1,1],
+    riverBed:b.riverBed?chk(b.riverBed):-1,structs:b.structures||{},tint:b.waterTint?hexRGB(b.waterTint).map(v=>v/255):[1,1,1],
+    deepTint:b.waterDeepTint?hexRGB(b.waterDeepTint).map(v=>v/255):null,
     foliageTint:b.foliageTint?hexRGB(b.foliageTint).map(v=>v/255):[1,1,1],
     surface:b.surface.map(r=>{let acc=0;return {when:r.when,layers:r.layers.map(l=>({id:chk(l.block),end:l.depth==null?null:acc+=l.depth}))}})}});
 
@@ -708,12 +902,18 @@ const BIO=BIOME_NAMES.map(n=>{const b=BIOMES[n],chk=k=>{if(ID[k]===undefined)thr
 //   葉は全面、草ブロックは上面のみ(側面の土は無着色。草の縁は 'grass_side_overlay' を別途着色して重ねる)。
 //   Worker にも文字列化して埋め込むため、外側の変数は参照しないこと(ID は引数で受け取る)。
 function faceTinted(ID,t,k){return t===ID.leaves||(t===ID.grass&&k==='top')}
-// 格子点(x,z)の周囲 2R×2R セルの葉色の平均を out=[r,g,b] に書く。cell(x,z) はそのセルのバイオームの葉色 [r,g,b] を返す関数。
-//   メッシュ(ワーカー)は頂点ごと、パーティクルは破壊位置でこれを使うので、どこでも同じ色になる。ワーカーにも埋め込むため外側の変数は参照しないこと。
-function blendFoliage(cell,R,x,z,out){
-  let r=0,g=0,b=0;
-  for(let dz=-R;dz<R;dz++)for(let dx=-R;dx<R;dx++){const t=cell(x+dx,z+dz);r+=t[0];g+=t[1];b+=t[2]}
-  const n=4*R*R;out[0]=r/n;out[1]=g/n;out[2]=b/n;return out;
+// 格子点(x,z)の周囲 2R×2R セルのバイオーム色を平均する共通処理。
+// cell は RGBだけでなく任意長の色ベクトルも返せるため、草・葉・水の浅瀬色/深み色で同じ補間ロジックを使う。
+// メッシュ(ワーカー)とパーティクルなど、呼び出し側が違っても同じ座標なら同じ色になる。
+function blendBiomeColor(cell,R,x,z,out){
+  out.fill(0);
+  for(let dz=-R;dz<R;dz++)for(let dx=-R;dx<R;dx++){
+    const t=cell(x+dx,z+dz);
+    for(let k=0;k<out.length;k++)out[k]+=t[k]||0;
+  }
+  const scale=1/(4*R*R);
+  for(let k=0;k<out.length;k++)out[k]*=scale;
+  return out;
 }
 const DEFAULT_FOLIAGE=(BIO.find(b=>b.name==='plains')||{}).foliageTint||[1,1,1];   // UI(インベントリ・ホットバー)で使う標準の葉色
 // ワールド座標(ブロックの角 wx,wz)のなめらかな葉色。未読み込みのセルは標準色として扱う
@@ -723,7 +923,7 @@ function foliageTintAt(wx,wz){
     const b=c&&c.biome?BIO[c.biome[((z-cz*16)<<4)+(x-cx*16)]]:null;
     return b&&b.foliageTint||DEFAULT_FOLIAGE;
   };
-  return blendFoliage(cell,CONFIG.terrain.foliageBlend,wx,wz,[0,0,0]);
+  return blendBiomeColor(cell,CONFIG.terrain.foliageBlend,wx,wz,[0,0,0]);
 }
 // タイル(元画像)に色を掛けた canvas を返す(tint 省略で無着色)。結果はキャッシュ
 const TINTED_TILE_CACHE=new Map();
@@ -750,7 +950,7 @@ function blockIconURL(id){
     if(id===ID.grass&&k==='side'&&TEX_INDEX.grass_side_overlay!==undefined)L.push(tintedTile('grass_side_overlay',DEFAULT_FOLIAGE));
     return L;
   };
-  if(CROSS[id]||id>=1000){ctx.drawImage(layers('side')[0],0,0,S,S)}   // 平面アイコン
+  if(CROSS[id]||TORCH[id]||id>=1000){ctx.drawImage(layers('side')[0],0,0,S,S)}   // 植物・松明・アイテムは平面アイコン
   else{
     // 正立方体の等角投影: 辺の長さ e=S/2、幅 W=e·√3、全体の高さ=S
     const e=S/2,W=e*Math.sqrt(3),cx=S/2,k=1.02;   // k: 面同士の継ぎ目に隙間が出ないよう僅かに拡大して重ねる
@@ -799,7 +999,7 @@ function getBlockColor(id){
 //    Smoothstep で滑らかに繋ぐ。旧世代コードを保持し続けずに断崖絶壁を防ぐ。
 // 4. 定数メモリ保証(O(1)): LRU管理により、遠く離れたチャンクは確実にメモリから解放。
 // 5. 重い処理(地形生成・ストラクチャー配置・ライティング・メッシュ生成)は Web Worker に委託。メインスレッドは描画・物理・編集だけ。
-const GEN_VERSION=2;   // 2: バイオーム・海・川を導入
+const GEN_VERSION=3;   // 3: 気候領域による砂浜バイオームを追加
 let SEED=CONFIG.seed??(Date.now()&0x7fffffff);
 
 // 二段Map。560兆座標でもキーのビット落ちを起こさない
@@ -896,13 +1096,13 @@ const STRUCT_LIST=Object.values(STRUCT).filter(S=>S.spawn);
 function chunkEngine(post){
   const fade=t=>t*t*t*(t*(t*6-15)+10),lerp=(t,a,b)=>a+t*(b-a),smoothstep=t=>t<=0?0:t>=1?1:t*t*(3-2*t);
   const grad=(h,x,y)=>{switch(h&3){case 0:return x+y;case 1:return -x+y;case 2:return x-y;default:return -x-y}};
-  let CFG,H=256,GEN=1,ID,LIGHT,CUT,CROSS,BEDROCK_ID=0,LAYERS=[],FACES=[],FACE_UV=[],TREE_LOD_UV=null,GRASS_SIDE_OVERLAY_UV=null,OPAQUE,SOLID,CULL,LIGHTBLOCK,CN=0,COORD_LIMIT=0;
+  let CFG,H=256,GEN=1,ID,LIGHT,CUT,CROSS,TORCH,MOUNT,EMISSION,BEDROCK_ID=0,LAYERS=[],FACES=[],FACE_UV=[],TREE_LOD_UV=null,GRASS_SIDE_OVERLAY_UV=null,OPAQUE,SOLID,CULL,LIGHTBLOCK,CN=0,COORD_LIMIT=0;
   let STRUCT_LIST=[],MAX_REACH=0,MAX_GAP=0;
-  let WG,BIO=[],SEA=0,WATER=0,TINT=[],FOLIAGE_TINT=[],BIO_O=[],BIO_L=[],TRANS,FLUID,FLUIDH;
+  let WG,BIO=[],SEA=0,WATER=0,WATER_TINTS=[],FOLIAGE_TINT=[],BIO_O=[],BIO_C=[],BIO_L=[],TRANS,FLUID,FLUIDH,FLUIDMINLIGHT;
   let SEED=0,epoch=0,hasLegacy=false,store=new ChunkMap(),chunks=new ChunkMap(),last=null;
   const q0=[],q1=[],uq=new Set();   // q0: ブロック編集の再メッシュ(最優先) / q1: ストリーミング要求
 
-  function setTables(t){CUT=t.CUT.slice();TRANS=t.TRANS.slice();FLUID=t.FLUID.slice();FLUIDH=t.FLUIDH.slice();CROSS=t.CROSS.slice();OPAQUE=t.OPAQUE.slice();SOLID=t.SOLID.slice();CULL=t.CULL.slice();LIGHTBLOCK=t.LIGHTBLOCK.slice();FACE_UV=t.FACE_UV;TREE_LOD_UV=t.TREE_LOD_UV;GRASS_SIDE_OVERLAY_UV=t.GRASS_SIDE_OVERLAY_UV}
+  function setTables(t){CUT=t.CUT.slice();TRANS=t.TRANS.slice();FLUID=t.FLUID.slice();FLUIDH=t.FLUIDH.slice();FLUIDMINLIGHT=t.FLUIDMINLIGHT.slice();CROSS=t.CROSS.slice();TORCH=t.TORCH.slice();MOUNT=t.MOUNT.slice();EMISSION=t.EMISSION.slice();OPAQUE=t.OPAQUE.slice();SOLID=t.SOLID.slice();CULL=t.CULL.slice();LIGHTBLOCK=t.LIGHTBLOCK.slice();FACE_UV=t.FACE_UV;TREE_LOD_UV=t.TREE_LOD_UV;GRASS_SIDE_OVERLAY_UV=t.GRASS_SIDE_OVERLAY_UV}
   function init(m){
     CFG=m.config;H=CFG.world.height;LIGHT=CFG.lighting;GEN=m.genVersion;ID=m.ID;BEDROCK_ID=ID.bedrock;
     CN=CFG.world.chunks;COORD_LIMIT=2**(53-CFG.terrain.octaves);
@@ -916,15 +1116,21 @@ function chunkEngine(post){
       {k:'side',d:[0,0,1],v:[[0,0,1],[1,0,1],[1,1,1],[0,1,1]],s:LIGHT.faces.z},
       {k:'side',d:[0,0,-1],v:[[1,0,0],[0,0,0],[0,1,0],[1,1,0]],s:LIGHT.faces.z}
     ];
+    for(const f of FACES){   // スムースライティング用: 面に平行な2軸(e1,e2)と、各頂点が面の中心から見てどちら側の角か(sg)
+      const a=f.d[0]?0:f.d[1]?1:2,ts=[0,1,2].filter(q=>q!==a);
+      f.e1=[0,0,0];f.e1[ts[0]]=1;f.e2=[0,0,0];f.e2[ts[1]]=1;
+      f.sg=f.v.map(v=>[v[ts[0]]*2-1,v[ts[1]]*2-1]);
+    }
     for(const f of FACES)f.va=f.v[0][0]!==f.v[3][0]?0:f.v[0][1]!==f.v[3][1]?1:2;   // va: その面のテクスチャV軸が向いているワールド軸(0=x,1=y,2=z)。木目の回転判定に使う
-    WG=m.wg;BIO=m.bio;SEA=WG.seaLevel;WATER=ID.water;TINT=BIO.map(b=>b.tint);FOLIAGE_TINT=BIO.map(b=>b.foliageTint||[1,1,1]);BIO_O=[];BIO_L=[];
-    BIO.forEach((b,i)=>{if(b.domain==='ocean')BIO_O.push(i);else if(b.domain==='land')BIO_L.push(i)});
+    WG=m.wg;BIO=m.bio;SEA=WG.seaLevel;WATER=ID.water;WATER_TINTS=BIO.map(b=>[...(b.tint||[1,1,1]),...(b.deepTint||b.tint||[1,1,1])]);FOLIAGE_TINT=BIO.map(b=>b.foliageTint||[1,1,1]);BIO_O=[];BIO_C=[];BIO_L=[];
+    BIO.forEach((b,i)=>{if(b.domain==='ocean')BIO_O.push(i);else if(b.domain==='coast')BIO_C.push(i);else if(b.domain==='land')BIO_L.push(i)});
     STRUCT_LIST=m.structs.map(S=>({...S,maxChance:Math.max(S.spawn.chance,...BIO.map(b=>b.structs[S.name]||0)),onIds:new Set(S.spawn.on.map(n=>ID[n])),reach:Math.max(...S.columns.map(([x,z])=>Math.max(Math.abs(x),Math.abs(z))))}));
     MAX_REACH=Math.max(0,...STRUCT_LIST.map(S=>S.reach));MAX_GAP=Math.max(0,...STRUCT_LIST.map(S=>S.spawn.spacing||0));
   }
   const inBounds=(cx,cz)=>CFG.world.infinite?Math.abs(cx)*16<=COORD_LIMIT&&Math.abs(cz)*16<=COORD_LIMIT:(cx>=0&&cz>=0&&cx<CN&&cz<CN);
   const layerAt=d=>{for(const l of LAYERS)if(l.end==null||d<l.end)return l.id;return BEDROCK_ID};
-  const newChunk=(cx,cz)=>({cx,cz,biome:new Uint8Array(256),data:new Uint8Array(16*H*16),light:new Int16Array(256),lo:H,hi:0,gen:GEN,modified:false});
+  // light はブロックごとの天空光レベル。地形より上は暗くなりようがないため、hi より上は暗黙にレベル15として扱い配列を節約する。
+  const newChunk=(cx,cz)=>({cx,cz,biome:new Uint8Array(256),data:new Uint8Array(16*H*16),light:new Uint8Array(0),blockLight:new Uint8Array(0),lightHeight:0,blockLightHeight:0,lightDirty:true,lo:H,hi:0,gen:GEN,modified:false});
 
   // ---------- 地形(元コードのまま) ----------
   function hash3(x,z,k){   // Math.imul は下位32bitだけ見るので、上位32bitも別に混ぜる(560兆スケール対応)
@@ -949,7 +1155,7 @@ function chunkEngine(post){
   }
   const curve=(p,x)=>{if(x<=p[0][0])return p[0][1];for(let i=1;i<p.length;i++)if(x<=p[i][0]){const a=p[i-1],b=p[i];return a[1]+(b[1]-a[1])*(x-a[0])/(b[0]-a[0])}return p[p.length-1][1]};
   function pick(c,t,hu){   // ドメイン内で気候空間の距離が最も近いバイオーム
-    const L=c<WG.oceanThreshold?BIO_O:BIO_L;let bi=L[0],bd=1e9;
+    const L=c<WG.oceanThreshold?BIO_O:c<WG.coastThreshold?BIO_C:BIO_L;let bi=L[0],bd=1e9;
     for(const i of L){const k=BIO[i].climate,d=(c-k.c)**2*2+(t-k.t)**2+(hu-k.h)**2;if(d<bd){bd=d;bi=i}}
     return bi;
   }
@@ -969,21 +1175,33 @@ function chunkEngine(post){
     const gx=Math.floor(x/4),gz=Math.floor(z/4),u=(x-gx*4)/4,w=(z-gz*4)/4;
     const A=blendOf(gx,gz),B=blendOf(gx+1,gz),C=blendOf(gx,gz+1),D=blendOf(gx+1,gz+1);
     const bl=k=>lerp(w,lerp(u,A[k],B[k]),lerp(u,C[k],D[k]));
-    const c=bl('c'),T=CFG.terrain,R=WG.river,r=Math.abs(bl('r'));
-    let h=curve(WG.baseCurve,c)+fbm(x,z,T.scale,T.octaves,64)*T.amplitude*curve(WG.ampCurve,c)*bl('ba')+bl('bo'),bi=pick(c,bl('t'),bl('h'));
-    // 海・大湖（oceanThreshold）に近づくにつれて川の影響を 0 に減衰させるフェードアウトを追加
-    const oceanFade = smoothstep((c - WG.oceanThreshold) / 0.08);
-    const f=smoothstep((c-R.cRange[0])/.1)*(1-smoothstep((c-R.cRange[1]+.1)/.1)) * oceanFade;   // 川が現れる大陸度の帯
-    if(f>0&&r<R.bankWidth){
-      const bank=1-smoothstep(r/R.bankWidth),bed=1-smoothstep(r/R.width);
-      h+=(Math.min(h,SEA+R.bankHeight)-h)*f*bank;   // 土手: 海面付近まで低くなだらかに
-      h+=(SEA-R.depth-h)*f*bed;                      // 川床
-      if(f*bed>.5&&BIO[bi].river>=0)bi=BIO[bi].river;
+    const c=bl('c'),T=CFG.terrain,R=WG.river,r=Math.abs(bl('r')),moisture=Math.max(0,Math.min(1,(bl('h')+1)*.5));
+    const terrainNoise=fbm(x,z,T.scale,T.octaves,64);
+    let h=curve(WG.baseCurve,c)+terrainNoise*T.amplitude*curve(WG.ampCurve,c)*bl('ba')+bl('bo'),bi=pick(c,bl('t'),bl('h'));
+    let riverSource=-1; // 川バイオームへ切り替える前の陸バイオーム。河床材の決定に使う。
+
+    // 河口を海岸で途切れさせない。川筋の下端を海側まで延ばし、海面下は既存の海水で自然につながる。
+    // 深海の地形を持ち上げないよう、河床・河岸の目標高は常に元の地表以下に制限する。
+    const f=smoothstep((c-R.cRange[0])/.1)*(1-smoothstep((c-R.cRange[1]+.1)/.1));
+    const coast=1-smoothstep(Math.max(0,c-WG.oceanThreshold)/.22);
+    const localVariation=Math.max(-1,Math.min(1,terrainNoise));
+    const widthScale=(.88+.24*moisture)*(1+localVariation*.12)*(1+coast*(R.coastalWiden||0));
+    const riverWidth=R.width*widthScale,bankWidth=Math.max(riverWidth*1.7,R.bankWidth*widthScale);
+    if(f>0&&r<bankWidth){
+      const bank=1-smoothstep(r/bankWidth),bed=1-smoothstep(r/riverWidth);
+      const bankTarget=Math.min(h,SEA+R.bankHeight);
+      const depth=R.depth*(.82+.36*moisture+localVariation*.06);
+      const bedTarget=Math.min(h,SEA-depth);
+      h+=(bankTarget-h)*f*bank;   // 河岸は広い範囲でなだらかに落とし、平らな棚を作りにくくする
+      h+=(bedTarget-h)*f*bed;     // 川床は湿度と地形ノイズに応じて少し変化させる
+      if(f*bed>.5&&BIO[bi].river>=0){riverSource=bi;bi=BIO[bi].river;}
     }
-    return {h:Math.max(T.min,Math.min(T.max,Math.round(h))),b:bi};
+    return {h:Math.max(T.min,Math.min(T.max,Math.round(h))),b:bi,riverSource};
   }
-  function rule(bi,x,z,h){   // 表層ルール: 最初に条件が合ったものを返す
+  const riverSurfaceCache=new Map();
+  function rule(bi,x,z,h,sourceBiome=-1){   // 表層ルール: バイオーム固有の表層と、元の陸バイオームによる河床材を適用
     const S=BIO[bi].surface,a=h-SEA;
+    let selected=S[S.length-1],selectedIndex=S.length-1;
     for(let k=0;k<S.length;k++){
       const w=S[k].when;
       if(w){
@@ -991,9 +1209,18 @@ function chunkEngine(post){
         if(w.y&&(h<w.y[0]||h>w.y[1]))continue;
         if(w.patch&&fbm(x,z,w.patch.scale,2,300+bi*16+k)<w.patch.min)continue;
       }
-      return S[k];
+      selected=S[k];selectedIndex=k;break;
     }
-    return S[S.length-1];
+    if(BIO[bi].domain==='river'&&sourceBiome>=0){
+      const bedId=BIO[sourceBiome].riverBed;
+      if(bedId>=0&&selected.layers.length&&selected.layers[0].id!==bedId){
+        const key=bi+':'+sourceBiome+':'+selectedIndex;
+        let variant=riverSurfaceCache.get(key);
+        if(!variant){variant={...selected,layers:selected.layers.map((layer,i)=>i===0?{...layer,id:bedId}:layer)};riverSurfaceCache.set(key,variant)}
+        return variant;
+      }
+    }
+    return selected;
   }
   const layOf=(ly,d)=>{for(const l of ly)if(l.end==null||d<l.end)return l.id;return BEDROCK_ID};
   function height(x,z,col){
@@ -1021,7 +1248,7 @@ function chunkEngine(post){
     const hv=hash3(x,z,i*4);if(hv>=S.maxChance)return null;
     const col=column(x,z),ch=BIO[col.b].structs[S.name]??S.spawn.chance;if(hv>=ch)return null;
     const r=sp.rotate?Math.floor(hash3(x,z,i*4+1)*4):0,gy=height(x,z,col);
-    if(gy<=SEA||!S.onIds.has(rule(col.b,x,z,gy).layers[0].id))return null;   // 水中・浜辺には生やさない
+    if(gy<=SEA||!S.onIds.has(rule(col.b,x,z,gy,col.riverSource).layers[0].id))return null;   // 水中・浜辺には生やさない
     let mn=1e9,mx=-1e9;
     for(const [cx,cz] of S.columns){
       const [dx,dz]=rot(cx,cz,r),px=x+dx,pz=z+dz;
@@ -1063,16 +1290,121 @@ function chunkEngine(post){
       c.data[o]=k.id; if(y>c.hi)c.hi=y;
     }
   }
-  function calcLightColumn(c,lx,lz){
-    const o=(lz<<4)+lx;let y=c.hi;
-    while(y>0&&!LIGHTBLOCK[c.data[y*256+o]])y--;
-    c.light[o]=y;
+  // 3x3チャンク内で天空光とブロック光を別々に再計算し、中央チャンクの結果を確定保存する。
+  // 直射天空光は遮光ブロックに当たるまで15を維持し、それ以外の光は空気中を1マスごとに減衰して伝播する。
+  // 隣接チャンクの光が変わった場合は、そのチャンクも再メッシュして境界の明暗を揃える。
+  // EMISSION[blockId] が 1〜15 のブロックは、そのレベルから周囲へ1マスごとに減衰して光を伝播する。
+  // 確定した描画明度は後段で max(天空光, ブロック光) を使うため、光源の追加・削除も同じ仕組みで更新できる。
+  function rebuildLightRegion(center,nb){
+    const SIZE=48,AREA=SIZE*SIZE,DIRS=[[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+    if(nb.every(c=>!c||(c.data&&c.light&&c.light.length&&c.blockLight&&c.blockLight.length&&!c.lightDirty)))
+      return nb.map(c=>c&&c.data?{c,height:c.lightHeight,blockHeight:c.blockLightHeight||c.lightHeight,light:c.light,blockLight:c.blockLight,old:c.light,oldBlockLight:c.blockLight,oldHeight:c.lightHeight}:null);
+    let regionMaxY=0;for(const c of nb)if(c&&c.data&&c.hi>regionMaxY)regionMaxY=c.hi;
+    regionMaxY=Math.min(H-1,regionMaxY);
+    const regionBlockHeight=Math.max(1,regionMaxY+1);
+    const maps=nb.map(c=>{
+      if(!c||!c.data)return null;
+      const height=Math.min(H,Math.max(1,(c.hi|0)+1));
+      return {c,height,blockHeight:regionBlockHeight,light:new Uint8Array(height*256),blockLight:new Uint8Array(regionBlockHeight*256),old:c.light,oldBlockLight:c.blockLight,oldHeight:c.lightHeight||0};
+    });
+    const indexOf=(x,z)=>((z>>4)*3+(x>>4));
+    const mapAt=(x,z)=>maps[indexOf(x,z)];
+    const blockAt=(x,y,z)=>{
+      if(y<0)return BEDROCK_ID;
+      if(y>=H||x<0||x>=SIZE||z<0||z>=SIZE)return 0;
+      const m=mapAt(x,z);if(!m)return 0;
+      return m.c.data[y*256+((z&15)<<4)+(x&15)];
+    };
+    const levelAt=(x,y,z)=>{
+      if(y<0||y>=H||x<0||x>=SIZE||z<0||z>=SIZE)return 15;
+      const m=mapAt(x,z);if(!m||y>m.c.hi||y>=m.height)return 15;
+      return m.light[y*256+((z&15)<<4)+(x&15)];
+    };
+    const setLevel=(x,y,z,v)=>{
+      const m=mapAt(x,z);if(!m||y<0||y>=m.height)return;
+      m.light[y*256+((z&15)<<4)+(x&15)]=v;
+    };
+    const blockLevelAt=(x,y,z)=>{
+      if(y<0||y>=H||x<0||x>=SIZE||z<0||z>=SIZE)return 0;
+      const m=mapAt(x,z);if(!m||y>=m.blockHeight)return 0;
+      return m.blockLight[y*256+((z&15)<<4)+(x&15)];
+    };
+    const setBlockLevel=(x,y,z,v)=>{
+      const m=mapAt(x,z);if(!m||y<0||y>=m.blockHeight)return;
+      m.blockLight[y*256+((z&15)<<4)+(x&15)]=v;
+    };
+    let maxY=0;
+    for(const m of maps)if(m&&m.c.hi>maxY)maxY=m.c.hi;
+    maxY=Math.min(H-1,maxY);
+
+    // 直射天空光。hi より上は levelAt() が暗黙に15を返す。
+    for(const m of maps){
+      if(!m)continue;
+      const d=m.c.data;
+      for(let col=0;col<256;col++)for(let y=m.height-1;y>=0;y--){
+        if(LIGHTBLOCK[d[y*256+col]])break;
+        m.light[y*256+col]=15;
+      }
+    }
+
+    // 直射光に隣接する空気へ14を与え、天空光を伝播する。
+    const skyQueue=[];
+    for(let y=0;y<=maxY;y++)for(let z=0;z<SIZE;z++)for(let x=0;x<SIZE;x++){
+      if(levelAt(x,y,z)!==15||LIGHTBLOCK[blockAt(x,y,z)])continue;
+      for(const [dx,dy,dz] of DIRS){
+        const nx=x+dx,ny=y+dy,nz=z+dz;
+        if(nx<0||nx>=SIZE||nz<0||nz>=SIZE||ny<0||ny>maxY||LIGHTBLOCK[blockAt(nx,ny,nz)])continue;
+        if(levelAt(nx,ny,nz)<14){setLevel(nx,ny,nz,14);skyQueue.push(ny*AREA+nz*SIZE+nx)}
+      }
+    }
+    for(let head=0;head<skyQueue.length;head++){
+      const id=skyQueue[head],y=Math.floor(id/AREA),r=id-y*AREA,z=Math.floor(r/SIZE),x=r-z*SIZE;
+      const next=levelAt(x,y,z)-1;if(next<=0)continue;
+      for(const [dx,dy,dz] of DIRS){
+        const nx=x+dx,ny=y+dy,nz=z+dz;
+        if(nx<0||nx>=SIZE||nz<0||nz>=SIZE||ny<0||ny>maxY||LIGHTBLOCK[blockAt(nx,ny,nz)])continue;
+        if(levelAt(nx,ny,nz)<next){setLevel(nx,ny,nz,next);skyQueue.push(ny*AREA+nz*SIZE+nx)}
+      }
+    }
+
+    // 発光ブロックを起点にブロック光を伝播。光源レベルそのものを持ち、隣の空気では1ずつ減衰する。
+    const blockQueue=[];
+    for(const m of maps){
+      if(!m)continue;
+      const d=m.c.data;
+      for(let y=0;y<m.height;y++)for(let z=0;z<16;z++)for(let x=0;x<16;x++){
+        const id=d[y*256+(z<<4)+x],em=EMISSION[id];
+        if(em<=0)continue;
+        m.blockLight[y*256+(z<<4)+x]=em;
+        const gx=(m.c.cx-center.cx+1)*16+x,gz=(m.c.cz-center.cz+1)*16+z;
+        if(gx>=0&&gx<SIZE&&gz>=0&&gz<SIZE)blockQueue.push(y*AREA+gz*SIZE+gx);
+      }
+    }
+    for(let head=0;head<blockQueue.length;head++){
+      const id=blockQueue[head],y=Math.floor(id/AREA),r=id-y*AREA,z=Math.floor(r/SIZE),x=r-z*SIZE;
+      const next=blockLevelAt(x,y,z)-1;if(next<=0)continue;
+      for(const [dx,dy,dz] of DIRS){
+        const nx=x+dx,ny=y+dy,nz=z+dz;
+        if(nx<0||nx>=SIZE||nz<0||nz>=SIZE||ny<0||ny>maxY||LIGHTBLOCK[blockAt(nx,ny,nz)])continue;
+        if(blockLevelAt(nx,ny,nz)<next){setBlockLevel(nx,ny,nz,next);blockQueue.push(ny*AREA+nz*SIZE+nx)}
+      }
+    }
+
+    // dirty な既存チャンクは再メッシュして、周辺チャンクの光も更新する。
+    const changed=[];
+    for(let i=0;i<maps.length;i++){
+      const m=maps[i];if(m&&m.c!==center&&m.c.lightDirty&&((m.old&&m.old.length)||(m.oldBlockLight&&m.oldBlockLight.length)))changed.push(m.c);
+    }
+    const cm=maps[4];
+    if(cm&&cm.c===center){center.light=cm.light;center.blockLight=cm.blockLight;center.lightHeight=cm.height;center.blockLightHeight=cm.blockHeight;center.lightDirty=false}
+    for(const c of changed)urgent(c.cx,c.cz);
+    return maps;
   }
   // ---------- チャンクの生成/復元 ----------
   function generateChunk(cx,cz){
     const c=newChunk(cx,cz),d=c.data,x0=cx*16,z0=cz*16;let mn=H,mx=0;
     for(let lz=0;lz<16;lz++)for(let lx=0;lx<16;lx++){
-      const X=x0+lx,Z=z0+lz,col=column(X,Z),h=height(X,Z,col),ly=rule(col.b,X,Z,h).layers;
+      const X=x0+lx,Z=z0+lz,col=column(X,Z),h=height(X,Z,col),ly=rule(col.b,X,Z,h,col.riverSource).layers;
       c.biome[lz*16+lx]=col.b;
       for(let y=0;y<=h;y++)d[y*256+lz*16+lx]=y===0?BEDROCK_ID:layOf(ly,h-y);
       for(let y=h+1;y<=SEA;y++)d[y*256+lz*16+lx]=WATER;
@@ -1082,7 +1414,6 @@ function chunkEngine(post){
     c.lo=mn;c.hi=mx;
     const ps=structuresNear(cx,cz);for(const p of ps)placeInChunk(c,p);
     c.structs=ps.filter(p=>p.x+p.S.reach>=x0&&p.x-p.S.reach<x0+16&&p.z+p.S.reach>=z0&&p.z-p.S.reach<z0+16).map(p=>({n:p.S.name,x:p.x,y:p.y,z:p.z,r:p.r}));
-    for(let lz=0;lz<16;lz++)for(let lx=0;lx<16;lx++)calcLightColumn(c,lx,lz);
     return c;
   }
   function decodeChunk(cx,cz,rec){
@@ -1095,7 +1426,6 @@ function chunkEngine(post){
     for(let lz=0;lz<16;lz++)for(let lx=0;lx<16;lx++)c.biome[lz*16+lx]=column(cx*16+lx,cz*16+lz).b;
     c.hi=rec.hi;c.lo=rec.lo;c.gen=rec.gen;
     c.modified=true;   // 復元されたデータは編集済みチャンク
-    for(let lz=0;lz<16;lz++)for(let lx=0;lx<16;lx++)calcLightColumn(c,lx,lz);
     return c;
   }
   // メモリ上の鏡。無ければ「保存記録から復元 or 新規生成」(元コードの world.chunk と同じ)
@@ -1107,6 +1437,10 @@ function chunkEngine(post){
       const o=c,r=store.get(cx,cz);c=r?decodeChunk(cx,cz,r):generateChunk(cx,cz);
       if(o){c.lod=o.lod;if(!c.modified)c.fc=o.fc}
       chunks.set(cx,cz,c);
+      // チャンクの追加/復元で光が通る境界が変わるため、既存の近傍ライトを無効化する。
+      for(let dz=-1;dz<=1;dz++)for(let dx=-1;dx<=1;dx++){
+        const n=chunks.get(cx+dx,cz+dz);if(n)n.lightDirty=true;
+      }
     }
     return last=c;
   }
@@ -1151,20 +1485,35 @@ function chunkEngine(post){
     const lx=p.x-cx*16,lz=p.z-cz*16;
     return p.y>=0&&p.y<H&&owner.data[p.y*256+(lz<<4)+lx]===info.trunk;
   }
-  // 葉・草の頂点色。チャンクの格子点(x,z=0〜16)ごとに blendFoliage で周囲のバイオーム色を平均する(結果はキャッシュ)。
-  //   隣り合うブロック・チャンクが同じ格子点を共有するので、バイオームの境目で色が階段状にならずなめらかにつながる。
-  //   getNb(dx,dz): 隣のチャンク(未生成なら null → 自チャンクの端のバイオームで代用)。at(x,z) は T 内の添字(T[i],T[i+1],T[i+2] が r,g,b)
+  // 共通のバイオーム色サンプラー。草・葉・水など、色テーブルを渡すだけで同じ補間ロジックを使える。
+  // colors[id] は RGB など任意長の色ベクトル。水は浅瀬RGB+深みRGBを6成分として1回の走査で平均する。
+  // 格子点ごとに結果をキャッシュし、隣接チャンクでも同じ座標には同じ色を返す。
   const ONE=[1,1,1];
-  function foliageSampler(c,getNb){
-    const R=CFG.terrain.foliageBlend,T=new Float32Array(17*17*3),done=new Uint8Array(17*17),out=[0,0,0];
+  function biomeColorSampler(c,getNb,colors){
+    const R=CFG.terrain.foliageBlend,channels=(colors[0]||ONE).length;
+    const T=new Float32Array(17*17*channels),done=new Uint8Array(17*17),size=16+2*R,stride=size+1;
+    let SAT=null;   // Summed-area table: builds once on first sample, then each 10x10 average is O(1).
     const cell=(lx,lz)=>{
       const dx=lx<0?-1:lx>15?1:0,dz=lz<0?-1:lz>15?1:0,n=dx||dz?getNb(dx,dz):c;
       const id=n&&n.biome?n.biome[((lz&15)<<4)+(lx&15)]:c.biome[(Math.min(15,Math.max(0,lz))<<4)+Math.min(15,Math.max(0,lx))];
-      return FOLIAGE_TINT[id]||ONE;
+      return colors[id]||colors[0]||ONE;
     };
-    return {T,at(x,z){
-      const k=z*17+x,i=k*3;
-      if(!done[k]){done[k]=1;blendFoliage(cell,R,x,z,out);T[i]=out[0];T[i+1]=out[1];T[i+2]=out[2]}
+    const buildSAT=()=>{
+      const a=new Float32Array(stride*stride*channels);
+      for(let z=0;z<size;z++)for(let x=0;x<size;x++){
+        const t=cell(x-R,z-R),o=((z+1)*stride+x+1)*channels,up=(z*stride+x+1)*channels,left=((z+1)*stride+x)*channels,diag=(z*stride+x)*channels;
+        for(let k=0;k<channels;k++)a[o+k]=t[k]+a[up+k]+a[left+k]-a[diag+k];
+      }
+      return a;
+    };
+    return {T,channels,at(x,z){
+      const k=z*17+x,i=k*channels;
+      if(!done[k]){
+        if(!SAT)SAT=buildSAT();
+        const x1=x+2*R,z1=z+2*R,br=(z1*stride+x1)*channels,tr=(z*stride+x1)*channels,bl=(z1*stride+x)*channels,tl=(z*stride+x)*channels,scale=1/(4*R*R);
+        for(let q=0;q<channels;q++)T[i+q]=(SAT[br+q]-SAT[tr+q]-SAT[bl+q]+SAT[tl+q])*scale;
+        done[k]=1;
+      }
       return i;
     }};
   }
@@ -1203,7 +1552,7 @@ function chunkEngine(post){
   function trim(c){   // 編集済みでないチャンクのフルデータを捨てる(必要なら ensure が決定論的に作り直す)
     if(c.modified||!c.data)return;
     if(!c.fc)c.fc=farColumns(c);
-    c.data=null;c.light=null;if(last===c)last=null;
+    c.data=null;c.light=null;c.blockLight=null;c.lightHeight=0;c.blockLightHeight=0;c.lightDirty=true;if(last===c)last=null;
   }
   function buildMeshFar(c,step=1){
     for(const B of [bufO,bufK]){if(!B.cap)growScratch(B,0);B.nv=0;B.ni=0;B.y0=H;B.y1=0}
@@ -1250,7 +1599,7 @@ function chunkEngine(post){
       return m===Infinity?-1:m;
     };
     const heightAt=(gx,gz,y)=>gx>=0&&gx<N&&gz>=0&&gz<N?gh[gz*N+gx]:edgeH(gx,gz,y);
-    const fsFar=foliageSampler(c,(dx,dz)=>chunks.get(c.cx+dx,c.cz+dz));   // 遠景の葉・草色(頂点ごと)
+    const fsFar=biomeColorSampler(c,(dx,dz)=>chunks.get(c.cx+dx,c.cz+dz),FOLIAGE_TINT);   // 遠景の葉・草色(頂点ごと)
     const emitQuad=(B,t,lx,y,lz,fi,kb,hh=1,ww=step,dd=step)=>{
       const f=FACES[fi],fu=FACE_UV[t];if(!fu)return;
       // LOD: 草ブロックは上面だけ草テクスチャ+バイオーム色、側面・下面は土(bottom)のテクスチャ・色をそのまま使う
@@ -1364,22 +1713,79 @@ function chunkEngine(post){
     emitTreeLod(); // 木は地形LODと独立した箱形状で描く
     let L=null;
     const P=[],C=[],U=[],I=[];let lv=0,a0=H,a1=0;
-    for(let gz=0;gz<N;gz++)for(let gx=0;gx<N;gx++){
-      const i=gz*N+gx,wy=gw[i],wt= gwt[i];if(wy<0||!wt)continue;
-      const lx=gx*step,lz=gz*step,sf=FLUIDH[wt]||.875,fu=FACE_UV[WATER],u=fu?fu.top:[0,0,1,1],kb=Math.round(255*LIGHT.lit*LIGHT.faces.top);
-      // 遠景LODでの周辺水色サンプル
-      let tr=0,tg=0,tb=0,tc=0;
-      for(let dz=-1;dz<=1;dz++) for(let dx=-1;dx<=1;dx++){
-        const bx=Math.max(0,Math.min(15,lx+dx)), bz=Math.max(0,Math.min(15,lz+dz));
-        const t=TINT[c.biome[(bz<<4)+bx]]||[1,1,1];
-        tr+=t[0]; tg+=t[1]; tb+=t[2]; tc++;
+    const fuWater=FACE_UV[WATER],uWater=fuWater?fuWater.top:[0,0,1,1],kbWater=Math.round(255*LIGHT.lit*LIGHT.faces.top);
+    // 水のバイオーム色も草・葉と同じ共通サンプラーで頂点ごとに補間する。
+    // 浅瀬色と深み色を6成分で一度に平均するため、同じ近傍セルを二重走査しない。
+    const waterTintGrid=new Float32Array(17*17*3);
+    const columnScratch=new Int16Array(3);
+    const farColumnAt=(x,z,out)=>{
+      const ox=x<0?-1:x>15?1:0,oz=z<0?-1:z>15?1:0,nc=(ox||oz)?chunks.get(c.cx+ox,c.cz+oz):c;
+      if(!nc)return false;
+      const nf=nc===c?fc:(nc.fc||(nc.data?(nc.fc=farColumns(nc)):null));if(!nf)return false;
+      const col=((z&15)<<4)+(x&15);out[0]=nf.h[col];out[1]=nf.w[col];out[2]=nf.wt[col];return true;
+    };
+    const farWaterDepthFactor=(x,z)=>{
+      if(!farColumnAt(x,z,columnScratch))return 0;
+      const ground=columnScratch[0],wy=columnScratch[1],wt=columnScratch[2];
+      if(ground<0||wy<0||!FLUID[wt])return 0;
+      const depth=wy+(FLUIDH[wt]||.875)-(ground+1);
+      return Math.max(0,Math.min(1,(depth-.875)/14));
+    };
+    const waterColors=biomeColorSampler(c,(dx,dz)=>chunks.get(c.cx+dx,c.cz+dz),WATER_TINTS);
+    for(let z=0;z<=16;z++)for(let x=0;x<=16;x++){
+      const i=waterColors.at(x,z),o=(z*17+x)*3,depth=farWaterDepthFactor(x,z),T=waterColors.T;
+      waterTintGrid[o]=T[i]+(T[i+3]-T[i])*depth;
+      waterTintGrid[o+1]=T[i+1]+(T[i+4]-T[i+1])*depth;
+      waterTintGrid[o+2]=T[i+2]+(T[i+5]-T[i+2])*depth;
+    }
+    const waterCorner=(x,z,y,wt)=>{
+      const fl=FLUID[wt];let sum=0,w=0;
+      for(let cz=z-1;cz<=z;cz++)for(let cx=x-1;cx<=x;cx++){
+        const has=farColumnAt(cx,cz,columnScratch),h=columnScratch[0],wy=columnScratch[1],wty=columnScratch[2];
+        // 上の水柱がこの角まで満たしているなら、角はブロック上端。
+        if(has&&wy>y&&h<y+1&&FLUID[wty]===fl)return 1;
+        // 水面の高さは、同じ高さ・同じ流体の実在する水柱だけで平均する。
+        // 乾いた列や未読み込みチャンクを高さ0として混ぜると、海岸・穴・チャンク境界で
+        // 水面が地形へ沈み、砂が露出したり面が交差してちらつく。
+        if(has&&wy===y&&FLUID[wty]===fl){
+          const weight=FLUIDH[wty]>.86?10:1;
+          sum+=FLUIDH[wty]*weight;w+=weight;
+        }
       }
-      const tn=[tr/tc, tg/tc, tb/tc];
+      // 隣接する水柱を見つけられない角も、0へ落とさず自分の水位を維持する。
+      return w?sum/w:(FLUIDH[wt]||.875);
+    };
+    const emitWaterQuad=(lx,lz,wy,wt,span)=>{
+      if(wy<0||!wt)return;
+      const vtx=FACES[2].v;
       for(let j=0;j<4;j++){
-        const v=FACES[2].v[j];P.push(lx+v[0]*step,wy+sf,lz+v[2]*step);
-        C.push(kb*tn[0],kb*tn[1],kb*tn[2]);U.push(j===1||j===2?u[2]:u[0],j>=2?u[3]:u[1]);
+        const v=vtx[j],x=lx+v[0]*span,z=lz+v[2]*span,ti=(z*17+x)*3;
+        const h=waterCorner(x,z,wy,wt),tr=waterTintGrid[ti],tg=waterTintGrid[ti+1],tb=waterTintGrid[ti+2];
+        P.push(x,wy+h,z);C.push(kbWater*tr,kbWater*tg,kbWater*tb);
+        U.push(j===1||j===2?uWater[2]:uWater[0],j>=2?uWater[3]:uWater[1]);
       }
-      I.push(lv,lv+1,lv+2,lv,lv+2,lv+3);lv+=4;if(wy<a0)a0=wy;if(wy+1>a1)a1=wy+1;
+      I.push(lv,lv+1,lv+2,lv,lv+2,lv+3);lv+=4;
+      if(wy<a0)a0=wy;if(wy+1>a1)a1=wy+1;
+    };
+    for(let gz=0;gz<N;gz++)for(let gx=0;gx<N;gx++){
+      const i=gz*N+gx,wy=gw[i],wt=gwt[i];if(wy<0||!wt)continue;
+      const lx=gx*step,lz=gz*step;
+      if(step===1){emitWaterQuad(lx,lz,wy,wt,1);continue}
+      // 4x4の遠景セルに岸辺・川・異なる水位が混じる場合だけ、濡れている列へ細分化する。
+      // 海のように水位と被覆が均一な領域は大きな1枚のままなので、遠景の頂点数を増やさない。
+      let wet=0,minSurface=Infinity,maxSurface=-Infinity;
+      for(let dz=0;dz<step;dz++)for(let dx=0;dx<step;dx++){
+        const col=((lz+dz)<<4)+(lx+dx),wy2=wMap[col],wt2=wTy[col];
+        if(wy2<0||!wt2)continue;
+        const surface=wy2+(FLUIDH[wt2]||.875);wet++;
+        if(surface<minSurface)minSurface=surface;if(surface>maxSurface)maxSurface=surface;
+      }
+      if(wet<step*step||maxSurface-minSurface>.2){
+        for(let dz=0;dz<step;dz++)for(let dx=0;dx<step;dx++){
+          const col=((lz+dz)<<4)+(lx+dx),wy2=wMap[col],wt2=wTy[col];
+          if(wy2>=0&&wt2)emitWaterQuad(lx+dx,lz+dz,wy2,wt2,1);
+        }
+      }else emitWaterQuad(lx,lz,wy,wt,step);
     }
     if(lv)L={nv:lv,P:new Float32Array(P),C:Uint8Array.from(C),U:new Float32Array(U),I:lv>65535?Uint32Array.from(I):Uint16Array.from(I),bs:[8,(a0+a1)/2,8,Math.hypot(8,8,(a1-a0)/2)]};
     const K=packBuf(bufK),R=packBuf(bufO)||{nv:0};R.K=K;R.L=L;return R;
@@ -1390,23 +1796,99 @@ function chunkEngine(post){
     const d=centerPos?Math.hypot(c.cx-centerPos.cx,c.cz-centerPos.cz):0;
     return c.lod=d>(CFG.streaming.lodFarDist||40)?2:d>CFG.streaming.lodDist?1:0;
   }
+  const SB=[0,0,0,0],OC9=new Uint8Array(9),LV9=new Float32Array(9);   // スムースライティングの作業用(ワーカー内で使い回す)
   function buildMesh(c,lod){
     if(lod===1)return buildMeshFar(c,1);
     if(lod>=2)return buildMeshFar(c,4);
     const nb=[];for(let dz=-1;dz<=1;dz++)for(let dx=-1;dx<=1;dx++)nb.push(ensure(c.cx+dx,c.cz+dz));
     const ni3=(lx,lz)=>(lz<0?0:lz>15?2:1)*3+(lx<0?0:lx>15?2:1);
+    const lightMaps=rebuildLightRegion(c,nb);
     const at=(lx,y,lz)=>{if(y<0)return BEDROCK_ID;if(y>=H)return 0;const n=nb[ni3(lx,lz)];return n?n.data[y*256+((lz&15)<<4)+(lx&15)]:0};
-    const lit=(lx,y,lz)=>{if(y<0||y>=H)return true;const n=nb[ni3(lx,lz)];return n?y>=n.light[((lz&15)<<4)+(lx&15)]:true};
+    const lightLevel=(lx,y,lz)=>{
+      if(y<0||y>=H)return 15;
+      const m=lightMaps[ni3(lx,lz)];if(!m||!m.c.data)return 15;
+      const o=y*256+((lz&15)<<4)+(lx&15),sky=y>m.c.hi||y>=m.height?15:m.light[o],emitted=y<m.blockHeight&&m.blockLight?m.blockLight[o]:0;
+      return Math.max(sky,emitted);
+    };
+    const shadeAt=(lx,y,lz,ambient=0)=>Math.min(1,LIGHT.lit*Math.max(lightLevel(lx,y,lz),ambient,FLUIDMINLIGHT[at(lx,y,lz)]||0)/15);
+    // ---- スムースライティング ----
+    // 面の前(法線側)の層にある 3x3 ブロックを調べ、4つの頂点それぞれについて「面の前のブロック・辺側の2ブロック・斜めの1ブロック」の4つを平均する。
+    //  - 天空光レベル: 不透明ブロックのサンプルは自分の明るさを持たないので、面の前のブロックの値で代用(影が壁に引きずられない)
+    //  - 遮蔽(AO): 不透明ブロックのサンプルは AOV(小さい値)として平均に入る → 壁際・谷間の角が暗くなる。辺側の2ブロックが両方塞がっていれば斜めも塞がり扱い
+    // 結果は SB[0..3](0〜255、面ごとの固定シェード込み)。戻り値 true = 四角形を 1-3 の対角線で割ると補間のゆがみが出にくい(AO の斜めスジ対策)
+    const SM=!!LIGHT.smooth,AOV=LIGHT.ao;
+    const faceLight=(lx,y,lz,f,ambient=0)=>{
+      const bx=lx+f.d[0],by=y+f.d[1],bz=lz+f.d[2],e1=f.e1,e2=f.e2;
+      for(let j=-1;j<=1;j++)for(let i=-1;i<=1;i++){
+        const x=bx+e1[0]*i+e2[0]*j,yy=by+e1[1]*i+e2[1]*j,z=bz+e1[2]*i+e2[2]*j,k=(j+1)*3+i+1;
+        OC9[k]=OPAQUE[at(x,yy,z)]?1:0;LV9[k]=shadeAt(x,yy,z,ambient);
+      }
+      const Lc=LV9[4];
+      for(let n=0;n<4;n++){
+        const s1=f.sg[n][0],s2=f.sg[n][1],ka=4+s1,kb=4+s2*3,kd=4+s1+s2*3;
+        const oa=OC9[ka],ob=OC9[kb],od=(oa&&ob)?1:OC9[kd];
+        const ao=(1+(oa?AOV:1)+(ob?AOV:1)+(od?AOV:1))*.25;
+        const l=(Lc+(oa?Lc:LV9[ka])+(ob?Lc:LV9[kb])+(od?Lc:LV9[kd]))*.25;
+        SB[n]=Math.min(1,f.s*l*ao)*255;
+      }
+      return SB[0]+SB[2]>SB[1]+SB[3];
+    };
     let y0=c.lo; for(const i of [1,3,5,7])if(nb[i]&&nb[i].lo<y0)y0=nb[i].lo;
     y0=Math.max(0,y0-1);
     for(const B of [bufO,bufK]){if(!B.cap)growScratch(B,0);B.nv=0;B.ni=0;B.y0=H;B.y1=0}
     const d=c.data,lq=[],ck=[];
-    const fs=foliageSampler(c,(dx,dz)=>nb[(dz+1)*3+dx+1]),FT=fs.T;   // 葉・草の頂点色(頂点ごとにバイオーム色を補間)
+    const fs=biomeColorSampler(c,(dx,dz)=>nb[(dz+1)*3+dx+1],FOLIAGE_TINT),FT=fs.T;   // 葉・草の頂点色(頂点ごとにバイオーム色を補間)
 
     const emit=(B,t,lx,y,lz)=>{   // 1ブロック分の面を B に書き出す
       const fu=FACE_UV[t];
+      if(TORCH[t]){   // 松明: バニラの松明モデル。2x2x10px の角柱(床置き=ブロック中央の地面、壁付け=根元を壁面の高さ3.5pxに置き、先端を22.5°外へ傾ける)
+        const mount=MOUNT[t],PX=1/16,LEN=10*PX,HW=PX,kb=Math.round(255*shadeAt(lx,y,lz));   // HW: 断面の半幅(1px)
+        let bx=.5,by=0,bz=.5,dx=1,dz=0,tilt=0;   // (bx,by,bz): 根元の中心 / (dx,dz): 先端が傾く向き(壁から離れる向き)
+        if(mount>=2){
+          tilt=Math.PI/8;by=3.5*PX;
+          if(mount===2){bx=1;dx=-1;dz=0}else if(mount===3){bx=0;dx=1;dz=0}else if(mount===4){bz=1;dx=0;dz=-1}else{bz=0;dx=0;dz=1}
+        }
+        const st=Math.sin(tilt),ct=Math.cos(tilt);
+        const Ax=dx*st,Ay=ct,Az=dz*st;      // 軸(根元→先端)
+        const Wx=-dz,Wy=0,Wz=dx;            // 軸に直交する水平ベクトル
+        const Nx=dx*ct,Ny=-st,Nz=dz*ct;     // 傾き面内で軸に直交するベクトル(= 軸 × W)
+        const ox=lx+bx,oy=y+by,oz=lz+bz;
+        // テクスチャ(タイル内のテクセル座標 → アトラスUV)。fu.side は 0.3px 内側に縮めたタイル全体なので、そこからテクセルの大きさを逆算する
+        const tu=fu.side,pu=(tu[2]-tu[0])/15.4,pv=(tu[3]-tu[1])/15.4;
+        const TU=x=>tu[0]+(x-.3)*pu,TV=r=>tu[3]-(r-.3)*pv;
+        // 面: [法線の符号付き基底 R(右), U(上), 中心, 半幅, 半高, UV(左,下,右,上)]。右×上=外向き法線 になる順(BL,BR,TR,TL)で頂点を出すので CCW(表向き)になる
+        const faces=[];
+        const side=(sx,sy,sz,ex,ey,ez)=>{   // 側面: 法線 n=(sx,sy,sz)、右 = 軸×n
+          const rx=Ay*sz-Az*sy,ry=Az*sx-Ax*sz,rz=Ax*sy-Ay*sx;
+          faces.push([rx,ry,rz,Ax,Ay,Az,ox+ex*HW+Ax*LEN*.5,oy+ey*HW+Ay*LEN*.5,oz+ez*HW+Az*LEN*.5,HW,LEN*.5,TU(7),TV(16),TU(9),TV(6)]);
+        };
+        side(Nx,Ny,Nz,Nx,Ny,Nz);          // +N 面
+        side(-Nx,-Ny,-Nz,-Nx,-Ny,-Nz);    // -N 面
+        side(Wx,Wy,Wz,Wx,Wy,Wz);          // +W 面
+        side(-Wx,-Wy,-Wz,-Wx,-Wy,-Wz);    // -W 面
+        // 上面(炎): 右=W、上=軸×W(=N)。テクスチャ y=6〜7 の 2x2
+        faces.push([Wx,Wy,Wz,Nx,Ny,Nz,ox+Ax*LEN,oy+Ay*LEN,oz+Az*LEN,HW,HW,TU(7),TV(8),TU(9),TV(6)]);
+        // 底面: 右=W、上=-N。テクスチャ y=13〜14 の 2x2(壁付けの先端側以外はほぼ見えない)
+        faces.push([Wx,Wy,Wz,-Nx,-Ny,-Nz,ox,oy,oz,HW,HW,TU(7),TV(15),TU(9),TV(13)]);
+        if(B.nv+24>B.cap)growScratch(B,B.nv+24);
+        const P=B.P,C=B.C,U=B.U,I=B.I;let nv=B.nv,ni=B.ni;
+        for(const f of faces){
+          const [rx,ry,rz,ux,uy,uz,cx,cy,cz,hr,hu,u0,v0,u1,v1]=f;
+          for(let j=0;j<4;j++){
+            const sr=j===1||j===2?1:-1,su=j>=2?1:-1,o=(nv+j)*3;   // BL,BR,TR,TL
+            P[o]=cx+rx*hr*sr+ux*hu*su;P[o+1]=cy+ry*hr*sr+uy*hu*su;P[o+2]=cz+rz*hr*sr+uz*hu*su;
+            C[o]=C[o+1]=C[o+2]=kb;
+            U[(nv+j)*2]=sr>0?u1:u0;U[(nv+j)*2+1]=su>0?v1:v0;
+          }
+          I[ni++]=nv;I[ni++]=nv+1;I[ni++]=nv+2;I[ni++]=nv;I[ni++]=nv+2;I[ni++]=nv+3;
+          nv+=4;
+        }
+        B.nv=nv;B.ni=ni;
+        if(y<B.y0)B.y0=y;if(y+1>B.y1)B.y1=y+1;
+        return;
+      }
       if(CROSS[t]){   // 十字形(植物): 斜め2枚の板。両面描画はマテリアル側
-        const u=fu.side,kb=Math.round(255*(lit(lx,y,lz)?LIGHT.lit:LIGHT.dark));
+        const u=fu.side,kb=Math.round(255*shadeAt(lx,y,lz));
         for(const q of [[[0,0,0],[1,0,1],[1,1,1],[0,1,0]],[[1,0,0],[0,0,1],[0,1,1],[1,1,0]]]){
           if(B.nv+4>B.cap)growScratch(B,B.nv+4);
           const P=B.P,C=B.C,U=B.U,I=B.I,nv=B.nv;let ni=B.ni;
@@ -1425,7 +1907,8 @@ function chunkEngine(post){
       for(const f of FACES){
         const nx=lx+f.d[0],ny=y+f.d[1],nz=lz+f.d[2],nbk=at(nx,ny,nz);
         if(OPAQUE[nbk]||(CULL[t]&&nbk===t))continue;   // 不透明に隠れる面 / cull:'same' で同じブロックに接する面は描かない
-        const kb=Math.round(Math.min(1,f.s*(lit(nx,ny,nz)?LIGHT.lit:LIGHT.dark))*255);
+        let kb=0,flip=false;
+        if(SM)flip=faceLight(lx,y,lz,f);else kb=Math.round(Math.min(1,f.s*shadeAt(nx,ny,nz))*255);
         let u=fu[f.k],ur=0;   // ur: UVの90°回転数
         if(fu.axis!==undefined){   // 軸付きブロック(原木): 軸に垂直な面=切り口(end)、それ以外=側面(side)。木目(テクスチャのV方向)が軸に沿うよう、必要なら90°回す
           if(f.d[fu.axis])u=fu.end;else{u=fu.side;ur=f.va===fu.axis?0:1}
@@ -1437,13 +1920,15 @@ function chunkEngine(post){
         if(B.nv+4>B.cap)growScratch(B,B.nv+4);
         const P=B.P,C=B.C,U=B.U,I=B.I,nv=B.nv;let ni=B.ni;
         for(let j=0;j<4;j++){
-          const v=f.v[j],o=(nv+j)*3;
+          const v=f.v[j],o=(nv+j)*3,kj=SM?Math.round(SB[j]):kb;
           P[o]=lx+v[0];P[o+1]=y+v[1];P[o+2]=lz+v[2];
-          if(useTint){const ti=fs.at(lx+v[0],lz+v[2]);C[o]=Math.round(kb*FT[ti]);C[o+1]=Math.round(kb*FT[ti+1]);C[o+2]=Math.round(kb*FT[ti+2])}
-          else C[o]=C[o+1]=C[o+2]=kb;
+          if(useTint){const ti=fs.at(lx+v[0],lz+v[2]);C[o]=Math.round(kj*FT[ti]);C[o+1]=Math.round(kj*FT[ti+1]);C[o+2]=Math.round(kj*FT[ti+2])}
+          else C[o]=C[o+1]=C[o+2]=kj;
           const jj=(j+ur)&3;U[(nv+j)*2]=jj===1||jj===2?u[2]:u[0];U[(nv+j)*2+1]=jj>=2?u[3]:u[1];
         }
-        I[ni++]=nv;I[ni++]=nv+1;I[ni++]=nv+2;I[ni++]=nv;I[ni++]=nv+2;I[ni++]=nv+3;B.ni=ni;B.nv=nv+4;
+        if(flip){I[ni++]=nv+1;I[ni++]=nv+2;I[ni++]=nv+3;I[ni++]=nv+1;I[ni++]=nv+3;I[ni++]=nv}   // 対角線を 1-3 に切り替え(向きは同じ)
+        else{I[ni++]=nv;I[ni++]=nv+1;I[ni++]=nv+2;I[ni++]=nv;I[ni++]=nv+2;I[ni++]=nv+3}
+        B.ni=ni;B.nv=nv+4;
         if(y<B.y0)B.y0=y; if(y+1>B.y1)B.y1=y+1;
 
         // 草ブロック側面の「草部分」オーバーレイ: 透明部分のあるタイルなので切り抜きメッシュ(bufK)へ、バイオーム色を掛けて重ねる
@@ -1452,12 +1937,14 @@ function chunkEngine(post){
           if(K.nv+4>K.cap)growScratch(K,K.nv+4);
           const PK=K.P,CK=K.C,UK=K.U,IK=K.I,nk=K.nv;let nik=K.ni;
           for(let j=0;j<4;j++){
-            const v=f.v[j],o=(nk+j)*3;
+            const v=f.v[j],o=(nk+j)*3,kj=SM?Math.round(SB[j]):kb;
             PK[o]=lx+v[0]+f.d[0]*EPS;PK[o+1]=y+v[1];PK[o+2]=lz+v[2]+f.d[2]*EPS;
-            const ti=fs.at(lx+v[0],lz+v[2]);CK[o]=Math.min(255,Math.round(kb*FT[ti]));CK[o+1]=Math.min(255,Math.round(kb*FT[ti+1]));CK[o+2]=Math.min(255,Math.round(kb*FT[ti+2]));
+            const ti=fs.at(lx+v[0],lz+v[2]);CK[o]=Math.min(255,Math.round(kj*FT[ti]));CK[o+1]=Math.min(255,Math.round(kj*FT[ti+1]));CK[o+2]=Math.min(255,Math.round(kj*FT[ti+2]));
             UK[(nk+j)*2]=j===1||j===2?uo[2]:uo[0];UK[(nk+j)*2+1]=j>=2?uo[3]:uo[1];
           }
-          IK[nik++]=nk;IK[nik++]=nk+1;IK[nik++]=nk+2;IK[nik++]=nk;IK[nik++]=nk+2;IK[nik++]=nk+3;K.ni=nik;K.nv=nk+4;
+          if(flip){IK[nik++]=nk+1;IK[nik++]=nk+2;IK[nik++]=nk+3;IK[nik++]=nk+1;IK[nik++]=nk+3;IK[nik++]=nk}
+          else{IK[nik++]=nk;IK[nik++]=nk+1;IK[nik++]=nk+2;IK[nik++]=nk;IK[nik++]=nk+2;IK[nik++]=nk+3}
+          K.ni=nik;K.nv=nk+4;
           if(y<K.y0)K.y0=y; if(y+1>K.y1)K.y1=y+1;
         }
       }
@@ -1483,29 +1970,45 @@ function chunkEngine(post){
     };
     if(lq.length){   // 半透明: 同じ流体/不透明ブロックとの間の面は出さない。水面は FLUIDH の高さまで下げ、バイオームの水色を掛ける
       const P=[],C=[],U=[],I=[];let lv=0,a0=H,a1=0;
-      // 周囲（5x5範囲）のバイオームの水色をサンプルして平均化し、色遷移を滑らかにする関数
-      const getSmoothTint = (lx, lz) => {
-        let r = 0, g = 0, b = 0, count = 0;
-        for (let dz = -2; dz <= 2; dz++) {
-          for (let dx = -2; dx <= 2; dx++) {
-            const nx = lx + dx, nz = lz + dz;
-            const n = nb[ni3(nx, nz)];
-            const bioId = (n && n.biome) ? n.biome[((nz & 15) << 4) + (nx & 15)] : c.biome[(lz << 4) + lx];
-            const t = TINT[bioId] || [1, 1, 1];
-            r += t[0]; g += t[1]; b += t[2]; count++;
-          }
-        }
-        return [r / count, g / count, b / count];
+      // 水深係数は列の同じ水域について一度だけ計算。複数の水たまりが縦に分離している列も区別する。
+      const waterDepthCache=new Float32Array(256).fill(-1),waterTopCache=new Int16Array(256).fill(-1),waterBottomCache=new Int16Array(256).fill(-1);
+      const getWaterDepthFactor=(lx,y,lz,fl)=>{
+        const col=((lz&15)<<4)+(lx&15);
+        if(y>=waterBottomCache[col]&&y<=waterTopCache[col])return waterDepthCache[col];
+        let top=y,bottom=y;
+        while(top+1<H&&FLUID[at(lx,top+1,lz)]===fl)top++;
+        while(bottom>0&&FLUID[at(lx,bottom-1,lz)]===fl)bottom--;
+        let bed=bottom-1;while(bed>=0&&!SOLID[at(lx,bed,lz)])bed--;
+        const depth=top+(FLUIDH[at(lx,top,lz)]||.875)-(bed+1);
+        const factor=Math.max(0,Math.min(1,(depth-.875)/14));
+        waterTopCache[col]=top;waterBottomCache[col]=bottom;waterDepthCache[col]=factor;return factor;
       };
+      // 水も草・葉と同じ共通バイオーム色サンプラーを使う。浅瀬色/深み色は一度の近傍走査で平均する。
+      // 格子点の色を各頂点へ適用するため、バイオーム境界がブロック単位の段差にならない。
+      const waterTintSampler=biomeColorSampler(c,(dx,dz)=>nb[(dz+1)*3+dx+1],WATER_TINTS);
       for(let q=0;q<lq.length;q+=4){
-        const lx=lq[q],y=lq[q+1],lz=lq[q+2],t=lq[q+3],fl=FLUID[t],fu=FACE_UV[t],tn=fl?getSmoothTint(lx,lz):[1,1,1];
+        const lx=lq[q],y=lq[q+1],lz=lq[q+2],t=lq[q+3],fl=FLUID[t],fu=FACE_UV[t];
+        const depthFactor=fl?getWaterDepthFactor(lx,y,lz,fl):0;
         const tp=!!fl&&FLUID[at(lx,y+1,lz)]!==fl;   // 水面(上に同じ流体が無い)
         for(const f of FACES){
           const nx=lx+f.d[0],ny=y+f.d[1],nz=lz+f.d[2],n=at(nx,ny,nz);
           if(OPAQUE[n]||n===t||(fl&&FLUID[n]===fl))continue;
-          const kb=Math.min(1,f.s*(lit(nx,ny,nz)?LIGHT.lit:LIGHT.dark))*255,u=fu[f.k];
-          for(let j=0;j<4;j++){const v=f.v[j];P.push(lx+v[0],y+(v[1]?(tp?ch(lx,y,lz,v[0],v[2],fl):1):0),lz+v[2]);C.push(kb*tn[0],kb*tn[1],kb*tn[2]);U.push(j===1||j===2?u[2]:u[0],j>=2?u[3]:u[1])}
-          I.push(lv,lv+1,lv+2,lv,lv+2,lv+3);lv+=4;if(y<a0)a0=y;if(y+1>a1)a1=y+1;
+          let kb=0,flp=false;const u=fu[f.k];
+          if(SM)flp=faceLight(lx,y,lz,f,FLUIDMINLIGHT[t]||0);else kb=Math.min(1,f.s*shadeAt(nx,ny,nz,FLUIDMINLIGHT[t]||0))*255;
+          for(let j=0;j<4;j++){
+            const v=f.v[j],kj=SM?SB[j]:kb,vx=lx+v[0],vz=lz+v[2];
+            P.push(vx,y+(v[1]?(tp?ch(lx,y,lz,v[0],v[2],fl):1):0),vz);
+            let tr=1,tg=1,tb=1;
+            if(fl){
+              const ti=waterTintSampler.at(vx,vz),T=waterTintSampler.T;
+              tr=T[ti]+(T[ti+3]-T[ti])*depthFactor;
+              tg=T[ti+1]+(T[ti+4]-T[ti+1])*depthFactor;
+              tb=T[ti+2]+(T[ti+5]-T[ti+2])*depthFactor;
+            }
+            C.push(kj*tr,kj*tg,kj*tb);U.push(j===1||j===2?u[2]:u[0],j>=2?u[3]:u[1]);
+          }
+          if(flp)I.push(lv+1,lv+2,lv+3,lv+1,lv+3,lv);else I.push(lv,lv+1,lv+2,lv,lv+2,lv+3);
+          lv+=4;if(y<a0)a0=y;if(y+1>a1)a1=y+1;
         }
       }
       if(lv)L={nv:lv,P:new Float32Array(P),C:Uint8Array.from(C),U:new Float32Array(U),I:lv>65535?Uint32Array.from(I):Uint16Array.from(I),bs:[8,(a0+a1)/2,8,Math.hypot(8,8,(a1-a0)/2)]};
@@ -1563,10 +2066,14 @@ function chunkEngine(post){
     const lx=m.x-cx*16,lz=m.z-cz*16;
     c.data[m.y*256+lz*16+lx]=m.b;c.fc=null;if(!m.sim||c.modified)c.modified=true;
     if(m.y<c.lo)c.lo=m.y; if(m.y>c.hi)c.hi=m.y;
-    calcLightColumn(c,lx,lz);
+    // 天空光は最大15マス先まで影響するため、周囲3x3チャンクのライトを無効化する。
+    for(let dz=-1;dz<=1;dz++)for(let dx=-1;dx<=1;dx++){
+      const n=chunks.get(cx+dx,cz+dz);if(n)n.lightDirty=true;
+    }
     urgent(cx,cz);
     if(lx===0)urgent(cx-1,cz); if(lx===15)urgent(cx+1,cz);
     if(lz===0)urgent(cx,cz-1); if(lz===15)urgent(cx,cz+1);
+    if(LIGHT.smooth&&(lx===0||lx===15)&&(lz===0||lz===15))urgent(cx+(lx?1:-1),cz+(lz?1:-1));   // スムースライティングは斜め隣のブロックも参照するので、角のブロックは斜めのチャンクも作り直す
   }
   function center(m){   // プレイヤーから遠い鏡を捨てる(メイン側の解放範囲より広く取るので、メインが持つチャンクは必ず鏡にもある)
     const r2=m.r*m.r;
@@ -1596,6 +2103,7 @@ function chunkEngine(post){
       case 'load':q1.push({k:'L',cx:m.cx,cz:m.cz,epoch:m.epoch,r:m.r,lod:m.lod,nd:m.nd});kick();break;
       case 'mesh':q1.push({k:'M',cx:m.cx,cz:m.cz,epoch:m.epoch,r:m.r,lod:m.lod});kick();break;
       case 'edit':edit(m);break;
+      case 'lighting':LIGHT.smooth=m.smooth;LIGHT.ao=m.ao;break;   // ライティング設定の切り替え(メインが続けて全チャンクの再メッシュを要求する)
     }
   }
   return {handle};
@@ -1635,7 +2143,7 @@ const REGION_NEAR_SHIFT=2,REGION_FAR_SHIFT=3; // リージョン一辺: NEAR_DIS
 const REGION_DEBOUNCE=200,REGION_MAXWAIT=800;  // 結合は「新しいチャンクが来なくなって200ms後」か「最初の変更から800ms後」まで待つ(読み込み中の再結合の連発を防ぐ)
 
 // kind: 'mesh'(不透明) / 'K'(切り抜き) / 'L'(半透明の水)
-// 遠景LOD(lod=1)のチャンクの水は不透明マテリアルに混ぜて描く(遠くでは半透明の見た目差が分からず、Draw Callとブレンド負荷が減る)
+// 水LODも半透明メッシュとして結合し、通常チャンクとの見た目を連続させる。チャンクごとに分割せず、リージョン単位でDraw Call増加を抑える。
 // リージョン結合はフレームをまたいで少しずつ進める。
 // 巨大なTypedArrayを一度に走査していたため、チャンク到着直後にメインスレッドが跳ねる問題を避ける。
 function prepareMergeState(chunkEntries,kind){
@@ -1651,9 +2159,10 @@ function prepareMergeState(chunkEntries,kind){
     const m=entry.m;if(!m)continue;
     if(kind==='mesh'){
       if(m.nv)add(entry,m);
-      if(entry.lod&&m.L&&m.L.nv)add(entry,m.L);
+      // 水LODも不透明メッシュへ混ぜず、通常距離と同じ半透明描画に送る。
+      // これによりLOD切替時の不透明化をなくし、下の地形色が水色へ自然に混ざる。
     }else{
-      const part=kind==='K'?m.K:(entry.lod?null:m.L);if(part)add(entry,part);
+      const part=kind==='K'?m.K:m.L;if(part)add(entry,part);
     }
   }
   if(!totV)return null;
@@ -1894,6 +2403,13 @@ function setBlock(x,y,z,t,sim){   // sim: 成長などシミュレーション�
   engine.send({t:'edit',epoch,x,y,z,b:t,sim:!!sim});
   if(FK[t]||FK[old]||fluidNear(x,y,z))fluidWake(x,y,z);   // 流体が絡む変更だけ流れの更新キューへ   // ワーカーの鏡にも同じ変更を反映 → 隣接チャンク含め再メッシュ
   if(GRAV[t])gravityWake(x,y,z);if(GRAV[get(x,y+1,z)])gravityWake(x,y+1,z);   // 置いた/残ったブロックが宙に浮いていないか確認
+  if(old&&SOLID[old]&&!SOLID[t]){   // 固体の支えを失った壁付け/床置きブロックを自動で取り外す
+    const check=(tx,ty,tz,mount)=>{
+      if(ty<0||ty>=H)return;
+      const id=get(tx,ty,tz);if(MOUNT[id]===mount&&!SOLID[get(x,y,z)])setBlock(tx,ty,tz,0,sim);
+    };
+    check(x,y+1,z,1);check(x-1,y,z,2);check(x+1,y,z,3);check(x,y,z-1,4);check(x,y,z+1,5);
+  }
 }
 
 // ---------- ワーカーとの接続 ----------
@@ -1903,7 +2419,7 @@ const pending=new Map();   // 要求済みで未応答のチャンク("cx,cz" �
 const queued=new Set();   // 届いたが未反映(inbox 内)のチャンク: 重複要求の防止
 const inbox=[],inboxHi=[];            // ワーカーからの結果。フレームごとに予算内で反映する
 const GRASS_SIDE_OVERLAY_UV = uvOf('grass_side_overlay');
-const tablesNow=()=>({CUT:CUT.slice(),CROSS:CROSS.slice(),SOLID:SOLID.slice(),OPAQUE:OPAQUE.slice(),CULL:CULL.slice(),LIGHTBLOCK:LIGHTBLOCK.slice(),TRANS:TRANS.slice(),FLUID:FK.slice(),FLUIDH:FLUIDH.slice(),FACE_UV:Array.from(FACE_UV,u=>u||null),TREE_LOD_UV,GRASS_SIDE_OVERLAY_UV});
+const tablesNow=()=>({CUT:CUT.slice(),CROSS:CROSS.slice(),TORCH:TORCH.slice(),MOUNT:MOUNT.slice(),EMISSION:EMISSION.slice(),SOLID:SOLID.slice(),OPAQUE:OPAQUE.slice(),CULL:CULL.slice(),LIGHTBLOCK:LIGHTBLOCK.slice(),TRANS:TRANS.slice(),FLUID:FK.slice(),FLUIDH:FLUIDH.slice(),FLUIDMINLIGHT:FLUIDMINLIGHT.slice(),FACE_UV:Array.from(FACE_UV,u=>u||null),TREE_LOD_UV,GRASS_SIDE_OVERLAY_UV});
 const syncTables=()=>{if(engine)engine.send({t:'tables',tables:tablesNow()})};
 function startEngine(){
   const initMsg={t:'init',config:CONFIG,genVersion:GEN_VERSION,ID,structs:STRUCT_LIST,wg:WORLDGEN,bio:BIO,tables:tablesNow()};
@@ -1917,7 +2433,7 @@ function startEngine(){
     const fallback=why=>{if(done)return;done=true;clearTimeout(tm);try{w&&w.terminate()}catch(e){}console.warn('Worker を使えないためメインスレッドで動かします:',why);res(inline())};
     const tm=setTimeout(()=>fallback('timeout'),3000);
     try{
-      const src=[ChunkMap,rot,faceTinted,blendFoliage,chunkEngine].map(f=>f.toString()).join('\n')+'\nconst E=chunkEngine((m,t)=>postMessage(m,t||[]));onmessage=e=>E.handle(e.data);';
+      const src=[ChunkMap,rot,faceTinted,blendBiomeColor,chunkEngine].map(f=>f.toString()).join('\n')+'\nconst E=chunkEngine((m,t)=>postMessage(m,t||[]));onmessage=e=>E.handle(e.data);';
       url=URL.createObjectURL(new Blob([src],{type:'text/javascript'}));
       w=new Worker(url);
       w.onerror=e=>{if(e.preventDefault)e.preventDefault();if(!done)fallback(e.message||'error');else console.error('[chunk worker]',e.message||e)};
@@ -2117,18 +2633,18 @@ function flushDirty(){
 
 // ---------- Renderer / camera ----------
 // ---------- 描画設定(Esc メニューから変更 / localStorage に保存) ----------
-const GFX_DEF={mip:true,rd:8,sim:5,fog:true,fps:60,scale:100,auto:true,part:2,mobd:48,water:true,aa:false,dbg:1};
+const GFX_DEF={mip:true,rd:8,sim:5,fog:true,fps:60,scale:100,auto:true,part:2,mobd:48,water:true,aa:false,dbg:1,smooth:true,ao:2};
 const GFX_PRESET={
-  low:{rd:6,sim:4,fog:true,fps:60,scale:75,auto:true,part:1,mobd:32,water:false},
-  std:{rd:8,sim:5,fog:true,fps:60,scale:100,auto:true,part:2,mobd:48,water:true},
-  high:{rd:16,sim:8,fog:true,fps:60,scale:100,auto:true,part:2,mobd:64,water:true},
-  ultra:{rd:64,sim:8,fog:true,fps:60,scale:100,auto:true,part:2,mobd:64,water:true}};
+  low:{rd:6,sim:4,fog:true,fps:60,scale:75,auto:true,part:1,mobd:32,water:false,smooth:false},
+  std:{rd:8,sim:5,fog:true,fps:60,scale:100,auto:true,part:2,mobd:48,water:true,smooth:true,ao:2},
+  high:{rd:16,sim:8,fog:true,fps:60,scale:100,auto:true,part:2,mobd:64,water:true,smooth:true,ao:2},
+  ultra:{rd:64,sim:8,fog:true,fps:60,scale:100,auto:true,part:2,mobd:64,water:true,smooth:true,ao:2}};
 const GFX_KEY='watashi-gfx-v1',GFX=Object.assign({},GFX_DEF);
 try{Object.assign(GFX,JSON.parse(localStorage.getItem(GFX_KEY)||'{}'))}catch(e){}
 (function(){const c=(k,a,b)=>{const v=+GFX[k];GFX[k]=Number.isFinite(v)?Math.min(b,Math.max(a,v)):GFX_DEF[k]};
-  c('rd',2,64);c('sim',2,12);c('scale',50,200);c('mobd',16,64);c('part',0,2);c('dbg',0,2);
+  c('rd',2,64);c('sim',2,12);c('scale',50,200);c('mobd',16,64);c('part',0,2);c('dbg',0,2);c('ao',1,3);GFX.ao=Math.round(GFX.ao);
   if(![0,30,60,120].includes(+GFX.fps))GFX.fps=60;GFX.fps=+GFX.fps;
-  for(const k of ['mip','fog','auto','water','aa'])GFX[k]=!!GFX[k]})();
+  for(const k of ['mip','fog','auto','water','aa','smooth'])GFX[k]=!!GFX[k]})();
 const gfxSave=()=>{try{localStorage.setItem(GFX_KEY,JSON.stringify(GFX))}catch(e){}};
 const RENDER=CONFIG.render;
 RENDER.antialias=GFX.aa;RENDER.pixelRatio=GFX.scale/100;RENDER.minPixelRatio=Math.min(.5,RENDER.pixelRatio);RENDER.adaptive=GFX.auto;RENDER.maxFps=GFX.fps||1e4;
@@ -2140,8 +2656,23 @@ document.body.appendChild(renderer.domElement);
 const camera=new THREE.PerspectiveCamera(75,innerWidth/innerHeight,.1,120);
 addEventListener('resize',()=>{renderer.setSize(innerWidth,innerHeight);camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix()});
 // 描画距離 → 読み込み範囲・フォグ・遠クリップ面を一括で決める(以前は 4 / 24-48 / 120 が別々に固定されていた)
-let gfxScale=null;
+let gfxScale=null,lightKey=null;
+const AO_LEVELS=[0,.5,.25,.1];   // 角の暗さ 1=弱 2=標準 3=強(CONFIG.lighting.ao に入る値)
+// 全チャンクのメッシュを近い順に作り直す(ライティング設定の切り替え用)。遠景(LOD)はスムースライティングの対象外なので除く
+function remeshAll(){
+  if(!engine)return;
+  const list=[];
+  for(const c of world.chunks.values())if(c.meshed&&!(c.lod>0)){const dx=c.cx-stream.cx,dz=c.cz-stream.cz;list.push([dx*dx+dz*dz,c])}
+  list.sort((a,b)=>a[0]-b[0]);
+  for(const [,c] of list)engine.send({t:'mesh',epoch,cx:c.cx,cz:c.cz,r:1,lod:0});
+}
 function applyGfx(){
+  {   // ライティング: 設定が変わったらワーカーへ伝え、読み込み済みチャンクを作り直す
+    const sm=GFX.smooth?1:0,ao=AO_LEVELS[GFX.ao]||.25,lk=sm?sm+'|'+ao:'0';
+    CONFIG.lighting.smooth=sm;CONFIG.lighting.ao=ao;
+    if(lightKey!==null&&lightKey!==lk&&engine){engine.send({t:'lighting',smooth:sm,ao});remeshAll()}
+    lightKey=lk;
+  }
   const S=CONFIG.streaming,R=GFX.rd,end=Math.max(24,(R-1)*16);   // フォグ終端: 読み込み済み範囲の手前(端のチャンクのポップインを隠す)
   if(S.renderDistance!==R){S.renderDistance=R;stream.cx=NaN}      // NaN にして読み込み対象を作り直させる
   FOG0.n=GFX.fog?end*.5:1e5;FOG0.f=GFX.fog?end:1e5+1;             // フォグ OFF は距離を飛ばして実現(シェーダの再コンパイルを避ける)
@@ -2160,6 +2691,21 @@ const hl=new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1.
 hl.visible=false; scene.add(hl);
 
 // ---------- Raycast (voxel DDA) ----------
+// レイと「セル(cx,cy,cz)内の専用判定ボックス」の交差(スラブ法)。当たれば {t:距離, nx,ny,nz:入った面の法線}。始点が箱の中なら DDA の法線(dnx..)を使う
+function shapeBoxHit(id,cx,cy,cz,o,d,max,dnx,dny,dnz){
+  const k=id*6,mn=[cx+BOX[k],cy+BOX[k+1],cz+BOX[k+2]],mx=[cx+BOX[k+3],cy+BOX[k+4],cz+BOX[k+5]],oo=[o.x,o.y,o.z],dd=[d.x,d.y,d.z],n=[0,0,0];
+  let t0=-Infinity,t1=Infinity;
+  for(let a=0;a<3;a++){
+    if(Math.abs(dd[a])<1e-9){if(oo[a]<mn[a]||oo[a]>mx[a])return null;continue}
+    let ta=(mn[a]-oo[a])/dd[a],tb=(mx[a]-oo[a])/dd[a],sg=-1;
+    if(ta>tb){const q=ta;ta=tb;tb=q;sg=1}
+    if(ta>t0){t0=ta;n[0]=n[1]=n[2]=0;n[a]=sg}
+    if(tb<t1)t1=tb;
+  }
+  if(t0>t1||t1<0||t0>max)return null;
+  if(t0<0)return{t:0,nx:dnx,ny:dny,nz:dnz};
+  return{t:t0,nx:n[0],ny:n[1],nz:n[2]};
+}
 function raycast(ox,oz,o,d,max){
   let x=Math.floor(o.x),y=Math.floor(o.y),z=Math.floor(o.z);
   const sx=Math.sign(d.x),sy=Math.sign(d.y),sz=Math.sign(d.z);
@@ -2167,7 +2713,14 @@ function raycast(ox,oz,o,d,max){
   let mx=sx?(sx>0?x+1-o.x:o.x-x)*dx:Infinity,my=sy?(sy>0?y+1-o.y:o.y-y)*dy:Infinity,mz=sz?(sz>0?z+1-o.z:o.z-z)*dz:Infinity;
   let t=0,nx=0,ny=0,nz=0;
   while(t<=max){
-    if(y>=0&&TARG[get(ox+x,y,oz+z)])return{x:ox+x,y,z:oz+z,nx,ny,nz};
+    if(y>=0){
+      const id=get(ox+x,y,oz+z);
+      if(TARG[id]){
+        if(!BOXP[id])return{x:ox+x,y,z:oz+z,nx,ny,nz};
+        const bh=shapeBoxHit(id,x,y,z,o,d,max,nx,ny,nz);   // 専用判定のブロックは、箱に当たったときだけ命中(外れたら奥へ進む)
+        if(bh)return{x:ox+x,y,z:oz+z,nx:bh.nx,ny:bh.ny,nz:bh.nz,t:bh.t};
+      }
+    }
     if(mx<my&&mx<mz){x+=sx;t=mx;mx+=dx;nx=-sx;ny=0;nz=0}
     else if(my<mz){y+=sy;t=my;my+=dy;nx=0;ny=-sy;nz=0}
     else{z+=sz;t=mz;mz+=dz;nx=0;ny=0;nz=-sz}
@@ -2200,6 +2753,15 @@ function rebase(ox,oz){
 //   (原木: 上下の面にクリック→縦、東西の面→X軸、南北の面→Z軸)。向きのないブロックはそのまま
 function placedBlockId(id,h){
   const v=VARIANT[id];if(!v)return id;
+  const b=BLK[id];
+  if(b&&b.orient==='mount'){
+    if(h.ny===1)return v.floor||id;   // 上面へ置く場合だけ床置き型
+    if(h.nx>0)return v.xn||0;        // クリック面の反対側へ置き、支えは松明セルの -X 側
+    if(h.nx<0)return v.xp||0;
+    if(h.nz>0)return v.zn||0;
+    if(h.nz<0)return v.zp||0;
+    return 0;                        // 天井面には置かない
+  }
   return v[h.nx?'x':h.nz?'z':'y']||id;
 }
 class ParticleSystem{   // InstancedMesh 1個(draw call 1回)。粒ごとの Mesh/Material 生成をやめた
@@ -2326,7 +2888,7 @@ class FPSController{
     return new THREE.Vector3(-Math.sin(this.yaw)*c,Math.sin(this.pitch),-Math.cos(this.yaw)*c);
   }
   target(){return raycast(origin.x,origin.z,this.position,this.look(),this.reach)}
-  bd(h){return Math.hypot((h.x-origin.x)+.5-this.position.x,h.y+.5-this.position.y,(h.z-origin.z)+.5-this.position.z)-.5}
+  bd(h){if(h.t!==undefined)return h.t;return Math.hypot((h.x-origin.x)+.5-this.position.x,h.y+.5-this.position.y,(h.z-origin.z)+.5-this.position.z)-.5}
   overlapsBlock(bx,by,bz){   // 絶対ブロック座標のセルがプレイヤーの当たり判定と重なるか(設置・落下ブロックの着地で共用)
     const r=this.radius,feet=this.position.y-this.eyeHeight,lx=bx-origin.x,lz=bz-origin.z;
     return lx<this.position.x+r&&lx+1>this.position.x-r&&by<feet+this.height&&by+1>feet&&lz<this.position.z+r&&lz+1>this.position.z-r;
@@ -2350,7 +2912,9 @@ class FPSController{
       if(!this.block)return;
       const bx=h.x+h.nx,by=h.y+h.ny,bz=h.z+h.nz;
       if(by<0||by>=H||!world.inBounds(Math.floor(bx/16),Math.floor(bz/16))||!REPL[get(bx,by,bz)])return;
-      if(!this.overlapsBlock(bx,by,bz))setBlock(bx,by,bz,placedBlockId(this.block,h));
+      const placed=placedBlockId(this.block,h);if(!placed)return;
+      if(MOUNT[placed]&&!SOLID[t])return;   // 松明などの壁付け/床置きブロックは、クリックした支えが固体のときだけ設置
+      if(!this.overlapsBlock(bx,by,bz))setBlock(bx,by,bz,placed);
     }
   }
   hit(){
@@ -2583,36 +3147,291 @@ document.body.appendChild(toastEl);let toastT;
 function toast(s,ms=2500){toastEl.textContent=s;toastEl.style.opacity=1;clearTimeout(toastT);toastT=setTimeout(()=>toastEl.style.opacity=0,ms)}
 function giveBean(n='bean'){const i=ctl.hotbar.indexOf(0);if(i<0){toast('ホットバーがいっぱいです');return false}ctl.hotbar[i]=ID[n];ctl.inventory.render();return true}
 const wrap=a=>((a+Math.PI)%(2*Math.PI)+2*Math.PI)%(2*Math.PI)-Math.PI,clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const rr=r=>r[0]+Math.random()*(r[1]-r[0]);                       // [最小,最大] の乱数
+const inSt=(m,g)=>m.def.behavior.states[g].includes(m.st),isFlying=m=>inSt(m,'flying'),isBusy=m=>inSt(m,'busy');   // behavior.states のグループ判定
+const PHYS0=BEHAVIOR_DEFAULTS.physics;
 const turn=(m,to,dt,r)=>{m.yaw+=clamp(wrap(to-m.yaw),-r*dt,r*dt)},faceTo=(m,x,z)=>Math.atan2(-(x-m.x),-(z-m.z));
-function boxHit(m,x,y,z){const r=m.r,ox=origin.x,oz=origin.z;
-  for(let Y=Math.floor(y);Y<=Math.floor(y+m.h);Y++)for(let Z=Math.floor(z-r);Z<=Math.floor(z+r);Z++)for(let X=Math.floor(x-r);X<=Math.floor(x+r);X++)if(solid(ox+X,Y,oz+Z))return true;
-  return false}
-function phys(m,dt,vx,vz){   // 重力 + 軸ごとの衝突 + 1ブロックの段差登り
-  {const wet=FK[get(blk('x',m.x),Math.floor(m.y+.4),blk('z',m.z))];m.vy=wet?Math.max(-2,Math.min(2,m.vy+12*dt)):Math.max(m.vy-22*dt,-30)}   // 水中は浮く
-  for(const ax of [0,1]){const nx=m.x+(ax?0:vx*dt),nz=m.z+(ax?vz*dt:0);
-    if(!boxHit(m,nx,m.y,nz)){m.x=nx;m.z=nz}else if(m.on&&!boxHit(m,nx,m.y+1.01,nz)){m.y+=1.01;m.x=nx;m.z=nz}else m.bump=1}
+function boxHit(m,x,y,z){
+  const r=m.r,ox=origin.x,oz=origin.z,EPS=1e-7;
+  // AABBは [min,max) として扱う。ちょうど隣のブロック面に触れているだけの状態を
+  // 貫通扱いしないよう、左右・前後・頭上の上端に微小なepsilonを入れる。
+  const x0=Math.floor(x-r+EPS),x1=Math.floor(x+r-EPS);
+  const z0=Math.floor(z-r+EPS),z1=Math.floor(z+r-EPS);
+  const y0=Math.floor(y),y1=Math.floor(y+m.h-EPS);
+  for(let Y=y0;Y<=y1;Y++)for(let Z=z0;Z<=z1;Z++)for(let X=x0;X<=x1;X++)if(solid(ox+X,Y,oz+Z))return true;
+  return false
+}
+function phys(m,dt,vx,vz){   // 重力 + 軸ごとの衝突。水中では上下動を安定させ、障害物に当たった事実を消さない
+  const P=m.phys||PHYS0;   // behavior.physics(経路のジャンプ試験用の仮オブジェクトは phys を引き継ぐ)
+  m.climbCooldown=Math.max(0,(m.climbCooldown||0)-dt);
+  const X=blk('x',m.x),Z=blk('z',m.z);
+  const wet=!!FK[get(X,Math.floor(m.y+.05),Z)]||!!FK[get(X,Math.floor(m.y+.4),Z)];
+  m.inWater=wet;
+  if(wet){
+    // 水中で毎フレーム上向き速度を強制すると、水面を上下して岸際で振動する。
+    // 落下速度だけを浮力で弱め、ジャンプの上昇速度には通常の重力を適用する。
+    if(m.vy>0)m.vy=Math.max(0,m.vy-P.buoyUp*dt);
+    else m.vy=Math.min(0,m.vy+P.buoyDown*dt);
+  }else m.vy=Math.max(m.vy-P.gravity*dt,-P.fall);
+  for(const ax of [0,1]){
+    const nx=m.x+(ax?0:vx*dt),nz=m.z+(ax?vz*dt:0);
+    if(!boxHit(m,nx,m.y,nz)){m.x=nx;m.z=nz}
+    else if((m.on||wet)&&m.climbCooldown<=0&&!boxHit(m,nx,m.y+1.01,nz)){
+      // 地上の段差・水中からの岸上がり。ジャンプを開始できたときだけ衝突通知を消す。
+      m.vy=Math.max(m.vy,P.jump);m.climbCooldown=P.climbCooldown;m.bump=0;
+    }else m.bump=1;
+  }
   const ny=m.y+m.vy*dt;
   if(boxHit(m,m.x,ny,m.z)){if(m.vy<0)m.y=Math.floor(ny)+1.001;m.vy=0}else m.y=ny;
-  m.on=boxHit(m,m.x,m.y-.05,m.z)?1:0;   // 接地は足元を探って判定(フレームレートで揺らがない)
+  m.on=boxHit(m,m.x,m.y-.05,m.z)?1:0;
 }
 function pose(m,s,t){
   const A=m.def.anim||{};for(const o of Object.values(m.g))o.rotation.set(0,0,0);
   for(const k of ['base',s])for(const [n,r] of Object.entries(A[k]||{})){const o=m.g[n];if(o)for(const a in r){const v=r[a];o.rotation[a]=v[0]+(v[1]||0)*Math.sin(t*(v[2]||0))}}
 }
 const GOALS={   // true を返すとそのtickの担当(以降のゴールは評価しない)
-  carried(m){const c=m.carried;if(!c)return 0;m.x=c.x;m.y=c.y-c.def.errand.hang;m.z=c.z;m.yaw=c.yaw;m.ps='hang';return 1},
-  lookAt(m,dt,o,px,pz,dp){if(m.carried)return 0;if(dp<o.within)m.look=clamp(wrap(faceTo(m,px,pz)-m.yaw),-1,1);else m.look*=.9;return 0},
-  leave(m,dt,o,px,pz,dp){if(m.st!=='leave')return 0;m.x+=-Math.sin(m.yaw)*6.5*dt;m.z+=-Math.cos(m.yaw)*6.5*dt;m.y+=3.2*dt;m.ps='fly';if(dp>54)mobs.remove(m);return 1},
-  bring(m,dt){if(m.st!=='bring')return 0;
+  carried(m){const c=m.carried;if(!c)return 0;m.x=c.x;m.y=c.y-c.def.behavior.errand.hang;m.z=c.z;m.yaw=c.yaw;m.ps='hang';return 1},
+  lookAt(m,dt,o,px,pz,dp){if(m.carried)return 0;if(dp<o.within)m.look=clamp(wrap(faceTo(m,px,pz)-m.yaw),-o.maxLook,o.maxLook);else m.look*=o.relax;return 0},
+  leave(m,dt,o,px,pz,dp){if(m.st!==o.state)return 0;m.x+=-Math.sin(m.yaw)*o.speed*dt;m.z+=-Math.cos(m.yaw)*o.speed*dt;m.y+=o.climb*dt;m.ps='fly';if(dp>o.despawn)mobs.remove(m);return 1},
+  bring(m,dt,o){if(m.st!==o.state)return 0;
     const dx=m.tx-m.x,dz=m.tz-m.z,d=Math.hypot(dx,dz);m.ps='fly';
-    if(d>1){m.yaw=faceTo(m,m.tx,m.tz);m.x+=dx/d*9*dt;m.z+=dz/d*9*dt;m.y+=clamp(m.gy+10-m.y,-3*dt,3*dt)}
-    else{m.y-=2.4*dt;if(m.y<=m.gy+1.4){const v=m.cargo;v.carried=null;v.x=m.x;v.y=m.y-m.def.errand.hang;v.z=m.z;v.vy=0;m.cargo=null;m.st='idle';m.wild=true;m.vy=2.5;m.on=0}}
+    if(d>o.arrive){m.yaw=faceTo(m,m.tx,m.tz);m.x+=dx/d*o.speed*dt;m.z+=dz/d*o.speed*dt;m.y+=clamp(m.gy+o.cruise-m.y,-o.altRate*dt,o.altRate*dt)}
+    else{
+      // 着地中は着地点の真上に位置を合わせる。積み荷のY座標をハトの現在Yから逆算しない。
+      m.x=m.tx;m.z=m.tz;
+      const releaseY=m.gy+m.def.behavior.errand.hang;
+      m.y=Math.max(releaseY,m.y-o.descend*dt);
+      if(m.y<=releaseY+.0001){
+        const v=m.cargo;v.carried=null;v.x=m.tx;v.y=m.gy;v.z=m.tz;v.vy=0;v.on=1;v.air=0;v.st='idle';v.wild=true;v.hx=m.tx;v.hz=m.tz;
+        m.y=releaseY;m.cargo=null;m.st='idle';m.wild=true;m.vy=2.5;m.on=0;
+      }
+    }
     return 1},
-  eat(m,dt){if(m.st!=='eat')return 0;
-    if((m.t-=dt)<=0){const a=Math.random()*6.28;m.yaw=Math.atan2(-Math.cos(a),-Math.sin(a));m.st='leave';const E=m.def.errand;if(E)mobs.errands.push({t:E.delay[0]+Math.random()*(E.delay[1]-E.delay[0]),a,by:m.type});return 1}
+  eat(m,dt,o){if(m.st!==o.state)return 0;
+    if((m.t-=dt)<=0){const a=Math.random()*6.28;m.yaw=Math.atan2(-Math.cos(a),-Math.sin(a));m.st=o.next;const E=m.def.behavior.errand;if(E)mobs.errands.push({t:rr(E.delay),a,by:m.type});return 1}
     mobs.walk(m,dt,0);m.ps='peck';return 1},
-  approach(m,dt,o,px,pz,dp){if(ctl.block!==ID[o.item]||dp>=o.within)return 0;turn(m,faceTo(m,px,pz),dt,6);mobs.walk(m,dt,dp>1.3?o.speed:0);return 1},
-  wander(m,dt,o){mobs.walk(m,dt,mobs.wander(m,dt,o.speed));return 1},
+  scared(m,dt,o,px,pz){
+    const S=m.def.behavior.scare;
+    // 左クリック直後はその場で跳ねる。着地を待たず短い予備動作のあと、経路探索つきの高速逃走へ移る。
+    if(m.st===S.state&&m.scarePhase==='hop'){
+      m.scarePhaseT=(m.scarePhaseT||0)+dt;
+      mobs.walk(m,dt,0);
+      if(m.scarePhaseT>=S.hopTime){
+        m.scarePhase='dash';m.scareT=rr(S.dash);
+        m.recoverPurpose='flee';m.recoverActive=false;m.escapeRequested=true;m.escapePath=null;
+        m.recoverMode=null;m.recoverWait=0;m.recoverClimbKey=null;m.recoverClimbAttempts=0;
+        m.recoverThreatX=px;m.recoverThreatZ=pz;m.st='recover';
+      }
+      return 1;
+    }
+    if(m.st!==S.state&&m.recoverPurpose!=='flee')return 0;
+    if(m.recoverPurpose!=='flee')return 0;
+    m.recoverThreatX=px;m.recoverThreatZ=pz;
+    if((m.scareT-=dt)<=0){
+      m.st='idle';m.scareDir=null;m.scarePhase=null;m.scarePhaseT=0;
+      m.recoverPurpose=null;m.recoverActive=false;m.escapeRequested=false;m.escapePath=null;m.recoverMode=null;m.stuckT=0;
+      m.recoveryCooldown=S.afterCooldown;m.forageSearchT=rr(S.afterForageDelay);return 0;
+    }
+    if(!m.recoverActive){m.escapeRequested=true;m.st='recover'}
+    return 0;
+  },
+  waterEscape(m,dt,o){
+    if(!mobs.inWater(m)){
+      m.waterEscapeTarget=null;m.waterEscapeBlocked=0;m.waterEscapeSearchT=0;m.waterAvoidYaw=undefined;
+      return 0;
+    }
+    if(m.chatState)mobs.endChat(m);
+    if(m.st==='forage'||m.st==='forageEat'){m.beanTarget=null;m.st='idle'}
+    let target=m.waterEscapeTarget,search=!target;
+    if(target){
+      m.waterEscapeSearchT=(m.waterEscapeSearchT||0)-dt;
+      if(m.waterEscapeSearchT<=0){search=true;if(!mobs.dryLand(target.x,target.z,target.y))target=null}
+    }
+    if(search){target=mobs.findShore(m,o.radius);m.waterEscapeTarget=target;m.waterEscapeSearchT=.8}
+    if(!target){
+      // 陸地が見つからないほど広い水域では移動を止めず、方向を変えながら岸を探す。
+      m.waterEscapeFallbackT=(m.waterEscapeFallbackT||0)-dt;
+      if(m.waterEscapeFallbackT<=0){m.waterEscapeFallbackT=1.2+Math.random();m.waterEscapeFallbackYaw=m.yaw+(Math.random()<.5?-1:1)*(1.1+Math.random()*1.2)}
+      const ox=m.x,oz=m.z;turn(m,m.waterEscapeFallbackYaw,dt,o.fallbackTurn);mobs.walk(m,dt,o.wanderSpeed);
+      if(Math.hypot(m.x-ox,m.z-oz)<Math.max(.004,dt*.12)){m.waterEscapeBlocked=(m.waterEscapeBlocked||0)+dt;
+        if(m.waterEscapeBlocked>.55){m.waterEscapeFallbackYaw=wrap(m.waterEscapeFallbackYaw+Math.PI*(.55+Math.random()*.9));m.waterEscapeBlocked=0}}
+      else m.waterEscapeBlocked=0;
+      m.ps='walk';return 1;
+    }
+    const d=Math.hypot(target.x-m.x,target.z-m.z),ox=m.x,oz=m.z;
+    turn(m,faceTo(m,target.x,target.z),dt,o.turn);
+    mobs.walk(m,dt,o.speed);
+    if(Math.hypot(m.x-ox,m.z-oz)<Math.max(.004,dt*.18)&&d>1.1){
+      m.waterEscapeBlocked=(m.waterEscapeBlocked||0)+dt;
+      if(m.waterEscapeBlocked>.6){m.waterAvoidYaw=faceTo(m,target.x,target.z);m.waterEscapeTarget=null;m.waterEscapeSearchT=0;m.waterEscapeBlocked=0}
+    }else m.waterEscapeBlocked=0;
+    m.ps='walk';return 1;
+  },
+  recover(m,dt,o){
+    const B=m.def.behavior,S=B.scare,P=B.physics;
+    if(!m.escapeRequested&&!m.recoverActive)return 0;
+    if(m.inWater){m.escapeRequested=false;m.recoverActive=false;m.escapePath=null;m.recoverMode=null;m.recoverClimbKey=null;return 0}
+    if(!m.recoverActive){
+      m.escapeRequested=false;
+      m.escapePath=mobs.findEscapePath(m,o.radius,m.recoverPurpose||'recover',m.recoverThreatX,m.recoverThreatZ);
+      m.recoverMode=m.escapePath.mode||'inside';
+      m.recoverActive=true;m.recoverWait=0;m.st='recover';m.stuckT=0;
+      m.navVisited=m.navVisited||new Map();
+    }
+    let target=m.escapePath&&m.escapePath[0];
+    if(target){
+      // 経路上の足場を毎フレーム再検証。ブロックの追加・破壊で地形が変わったら古い経路を破棄する。
+      const live=mobs.standCell(m,target.cx,target.cz,target.y);
+      const liveEdge=mobs.navEdgeClear(m,{
+        cx:target.fromCx,cz:target.fromCz,x:target.fromX,z:target.fromZ,y:target.fromY
+      },{cx:target.cx,cz:target.cz,x:target.x,z:target.z,y:target.y},target.y-target.fromY>.35);
+      if(!live||Math.abs(live.y-target.y)>.15||!liveEdge){
+        m.escapePath=null;m.recoverWait=0;m.recoverClimbKey=null;m.climbCooldown=0;m.stuckT=0;
+        m.st='recover';mobs.walk(m,dt,0);m.ps='idle';return 1;
+      }
+    }
+    if(!target&&m.escapePath===null){
+      // 経路が地形変化や失敗で明示的に破棄された場合、古い「脱出/内部」判定に関係なく再探索する。
+      m.recoverWait=(m.recoverWait||0)-dt;
+      if(m.recoverWait>0){m.st='recover';mobs.walk(m,dt,0);m.ps='idle';return 1}
+      m.escapePath=mobs.findEscapePath(m,o.radius,m.recoverPurpose||'recover',m.recoverThreatX,m.recoverThreatZ);m.recoverMode=m.escapePath.mode||'inside';target=m.escapePath[0];
+      if(!target){m.recoverWait=o.retry;m.st='recover';mobs.walk(m,dt,0);m.ps='idle';return 1}
+    }
+    if(!target){
+      if(m.recoverMode==='inside'||m.recoverMode==='flee'){
+        // 脱出不能な穴では無理に出口を捏造せず、少し間を置いて到達可能範囲を再探索する。
+        m.recoverWait=(m.recoverWait||0)-dt;
+        if(m.recoverWait>0){m.st='recover';mobs.walk(m,dt,0);m.ps='idle';return 1}
+        m.escapePath=mobs.findEscapePath(m,o.radius,m.recoverPurpose||'recover',m.recoverThreatX,m.recoverThreatZ);m.recoverMode=m.escapePath.mode||'inside';
+        target=m.escapePath[0];
+        if(!target){m.recoverWait=o.retry;m.st='recover';mobs.walk(m,dt,0);m.ps='idle';return 1}
+      }else{
+        m.recoverActive=false;m.escapeRequested=false;m.stuckT=0;m.recoveryCooldown=1.1;m.st='idle';m.t=.25;return 0;
+      }
+    }
+    const d=Math.hypot(target.x-m.x,target.z-m.z);
+    if(d<.42&&Math.abs(target.y-m.y)<.42){
+      const key=`${target.cx},${target.cz},${Math.round(target.y)}`;
+      mobs.markNavVisited(m,target.cx,target.cz,target.y);
+      m.escapePath.shift();m.recoverClimbKey=null;m.stuckT=0;
+      target=m.escapePath[0];
+      if(!target){
+        if(m.recoverMode==='inside'||m.recoverMode==='flee'){
+          m.escapePath=mobs.findEscapePath(m,o.radius,m.recoverPurpose||'recover',m.recoverThreatX,m.recoverThreatZ);m.recoverMode=m.escapePath.mode||'inside';target=m.escapePath[0];
+          if(!target){m.recoverWait=o.retry;m.st='recover';mobs.walk(m,dt,0);m.ps='idle';return 1}
+        }else{
+          m.recoverActive=false;m.escapeRequested=false;m.recoveryCooldown=1.1;m.stuckT=0;m.st='idle';m.t=.25;return 0;
+        }
+      }
+    }
+    const rise=target.y-m.y;
+    if(rise>.45){
+      // ジャンプ可能なのは実測上の1ブロック程度まで。失敗した辺は封鎖し、同じ壁への連続ジャンプを止める。
+      if(rise>o.maxRise){m.escapePath=null;m.recoverWait=0;m.stuckT=0;mobs.walk(m,dt,0);m.ps='idle';return 1}
+      const edgeKey=target.edgeKey||mobs.navEdgeKey({cx:target.fromCx,cz:target.fromCz,y:target.fromY},{cx:target.cx,cz:target.cz,y:target.y});
+      if(m.recoverClimbKey!==edgeKey){m.recoverClimbKey=edgeKey;m.recoverClimbAttempts=0}
+      if(m.on&&m.climbCooldown<=0){
+        if(m.recoverClimbAttempts>=2){
+          m.navBlockedEdges=m.navBlockedEdges||new Map();m.navBlockedEdges.set(edgeKey,{until:mobs.T+10,signature:mobs.navEdgeSignature(m,{cx:target.fromCx,cz:target.fromCz,y:target.fromY},{cx:target.cx,cz:target.cz,y:target.y})});
+          m.escapePath=null;m.recoverWait=.05;m.recoverClimbKey=null;m.recoverClimbAttempts=0;m.stuckT=0;
+          mobs.walk(m,dt,0);m.ps='idle';return 1;
+        }
+        m.recoverClimbAttempts++;m.vy=Math.max(m.vy,P.jump);m.on=0;m.climbCooldown=P.jumpCooldown;
+      }
+    }
+    turn(m,faceTo(m,target.x,target.z),dt,m.recoverPurpose==='flee'?S.turn:o.turn);
+    // 逃走中は通常の回復歩行より速いダッシュ。経路自体は衝突判定済みの足場だけを使う。
+    m.st='recover';mobs.walk(m,dt,m.recoverPurpose==='flee'?S.speed:o.speed);m.ps=m.on?'walk':(B.flags.air?B.anim.air:'walk');
+    if((m.stuckT||0)>.78&&d>.5){
+      // 動いていない事実を経路に反映。タイムアウトするまで同じ記憶上の出口へ飛び続けない。
+      const edgeKey=target.edgeKey||mobs.navEdgeKey({cx:target.fromCx,cz:target.fromCz,y:target.fromY},{cx:target.cx,cz:target.cz,y:target.y});
+      m.navBlockedEdges=m.navBlockedEdges||new Map();m.navBlockedEdges.set(edgeKey,{until:mobs.T+10,signature:mobs.navEdgeSignature(m,{cx:target.fromCx,cz:target.fromCz,y:target.fromY},{cx:target.cx,cz:target.cz,y:target.y})});
+      m.escapePath=null;m.recoverWait=.05;m.recoverClimbKey=null;m.recoverClimbAttempts=0;m.climbCooldown=0;m.stuckT=0;
+    }
+    return 1;
+  },
+  approachPlayer(m,dt,o,px,pz,dp){
+    if(isBusy(m))return 0;
+    m.beanLureCooldown=Math.max(0,(m.beanLureCooldown||0)-dt);
+    if(ctl.block!==ID[o.lure]||dp>o.within||m.beanLureCooldown>0){
+      m.beanLureTarget=null;m.beanLureSearchT=0;
+      return 0;
+    }
+    let target=m.beanLureTarget;
+    m.beanLureSearchT=(m.beanLureSearchT||0)-dt;
+    if(!target||m.beanLureSearchT<=0||!mobs.pathClear(m,target.x,target.z,target.y)){
+      target=mobs.findPlayerApproach(m,px,pz);
+      m.beanLureTarget=target;m.beanLureSearchT=o.retarget;
+    }
+    if(!target)return 0;
+    const d=Math.hypot(target.x-m.x,target.z-m.z);
+    if(d<o.arrive){m.st='idle';mobs.walk(m,dt,0);m.ps='idle';return 1}
+    turn(m,faceTo(m,target.x,target.z),dt,o.turn);
+    m.st='walk';mobs.walk(m,dt,o.speed);m.ps='walk';return 1;
+  },
+  forage(m,dt,o){
+    if(isBusy(m))return 0;
+    let b=m.beanTarget;
+    if(b){
+      // 豆が取り除かれた・成長段階が変わった・経路に壁ができたら追跡を解除。
+      if(get(b.wx,b.y,b.wz)!==ID[o.target]||!mobs.pathClear(m,b.x,b.z,b.y)){
+        m.beanTarget=null;m.st='idle';m.forageSearchT=rr(o.failDelay);return 0;
+      }
+      const d=Math.hypot(m.x-b.x,m.z-b.z);turn(m,faceTo(m,b.x,b.z),dt,o.turn);
+      if(m.st==='forageEat'){
+        if(d>o.keep){m.st='forage';m.t=0;return 1}
+        mobs.walk(m,dt,0);m.ps='peck';
+        if((m.t-=dt)<=0){setBlock(b.wx,b.y,b.wz,ID[o.into],true);m.beanTarget=null;m.st='idle';m.forageSearchT=rr(o.doneDelay);return 1}
+        return 1;
+      }
+      m.st='forage';
+      if(d<=o.reach){m.st='forageEat';m.t=rr(o.eat);mobs.walk(m,dt,0);m.ps='peck';return 1}
+      mobs.walk(m,dt,o.speed);m.ps='walk';return 1;
+    }
+    if((m.forageSearchT-=dt)>0)return 0;
+    m.forageSearchT=rr(o.search);
+    b=mobs.findBean(m,o.radius,ID[o.target]);
+    if(!b)return 0;
+    m.beanTarget=b;m.st='forage';
+    return 1;
+  },
+  social(m,dt,o){
+    if(m.carried)return 0;
+    const partners=o.with==='self'?[m.type]:o.with;
+    let p=m.chatPartner;
+    if(m.chatState){
+      if(!p||p.dead||p.carried||isFlying(p)||!mobs.list.includes(p)||Math.hypot(m.x-p.x,m.z-p.z)>o.keep){mobs.endChat(m);return 0}
+      turn(m,faceTo(m,p.x,p.z),dt,o.turn);m.look=0;
+      if(m.chatState==='approach'){
+        if(!mobs.pathClear(m,p.x,p.z,p.y)){mobs.endChat(m);return 0}
+        const d=Math.hypot(m.x-p.x,m.z-p.z);
+        if(d<=o.reach){const t=rr(o.talk);m.chatState=p.chatState='talk';m.chatT=p.chatT=t;m.chatLeader=true;p.chatLeader=false;mobs.walk(m,dt,0);m.ps='talk';return 1}
+        mobs.walk(m,dt,o.speed);m.ps='walk';return 1;
+      }
+      if(m.chatState==='wait'){mobs.walk(m,dt,0);return 1}
+      if(m.chatState==='talk'){
+        mobs.walk(m,dt,0);m.ps='talk';
+        if(m.chatLeader&&(m.chatT-=dt)<=0)mobs.endChat(m);
+        return 1;
+      }
+      mobs.endChat(m);return 0;
+    }
+    if((m.socialSearchT-=dt)>0)return 0;
+    m.socialSearchT=rr(o.search);
+    if(Math.random()>o.chance)return 0;
+    let best=null,bd=o.within;
+    for(const q of mobs.list){
+      if(q===m||!partners.includes(q.type)||!q.def.behavior.params.social||q.dead||q.carried||q.chatState||isFlying(q))continue;
+      const d=Math.hypot(m.x-q.x,m.z-q.z);
+      if(d>bd||(best&&d>=bd)||!mobs.pathClear(m,q.x,q.z,q.y))continue;
+      best=q;bd=d;
+    }
+    if(!best)return 0;
+    m.chatPartner=best;m.chatState='approach';m.chatLeader=true;
+    best.chatPartner=m;best.chatState='wait';best.chatLeader=false;
+    return 1;
+  },
+  wander(m,dt,o){mobs.walk(m,dt,mobs.wander(m,dt,o));return 1},
   fall(m,dt,o){   // 重力ブロックの落下と着地。着地するとブロックに戻る
     if(m.land!==undefined){if((m.land-=dt)<=0)mobs.remove(m);return 1}   // 着地後は少しだけ残し、ワーカーのメッシュが届くまでの「消える」ちらつきを隠す
     const id=ID[m.vr];if(!id){mobs.remove(m);return 1}
@@ -2624,68 +3443,500 @@ const GOALS={   // true を返すとそのtickの担当(以降のゴールは評
     let y=ground;while(y<H&&solid(X,y,Z))y++;   // 落下中に下へ置かれたブロックがあれば、その上へ
     m.y=ground;m.vy=0;
     if(ctl.overlapsBlock(X,y,Z))return 1;       // プレイヤーが入っているセルには置かない(埋まって動けなくなるため)。どいたら着地する
-    setBlock(X,y,Z,id,true);m.y=y;m.land=.25;return 1;
+    setBlock(X,y,Z,id,true);m.y=y;m.land=o.linger;return 1;
   }
 };
+function validateBehaviors(){   // behavior データの書き間違いを起動時に警告する
+  for(const [n,d] of Object.entries(MOBS)){const B=d.behavior,w=t=>console.warn(`MOBS.${n}.behavior: ${t}`);
+    for(const [g,o] of B.goals){
+      if(!GOALS[g])w(`未知のゴール '${g}'`);
+      for(const k of Object.keys(o))if(GOAL_DEFAULTS[g]&&!(k in GOAL_DEFAULTS[g]))w(`ゴール '${g}' に未知のパラメータ '${k}'`);
+      for(const k of ['lure','target','into'])if(o[k]&&!(o[k] in ID))w(`ゴール '${g}' の ${k} '${o[k]}' はブロック名にありません`);
+      if(g==='social'&&o.with!=='self')for(const t of o.with)if(!MOBS[t])w(`social の相手 '${t}' は MOBS にありません`);
+    }
+    if(B.errand&&!MOBS[B.errand.cargo.type])w(`errand.cargo.type '${B.errand.cargo.type}' は MOBS にありません`);
+    for(const i of Object.values(B.interact))if(i.holding&&!(i.holding in ID))w(`interact.holding '${i.holding}' はブロック名にありません`);
+  }
+}
+validateBehaviors();
 const mobs={list:[],errands:[],park:[],seen:new Set(),T:0,spawnT:3,syncT:1,
   add(type,vr,x,y,z){
     const def=MOBS[type],b=buildMob(def,def.variants&&def.variants[vr]);
-    const m={type,def,vr,...b,x,y,z,r:def.r,h:def.h,yaw:def.yaw??Math.random()*6.28,vy:0,on:0,st:'idle',t:1+Math.random()*2,ty:0,look:0,acc:0,k:0,wild:false};
-    if(def.home){m.hx=x;m.hz=z}
+    const m={type,def,vr,...b,phys:def.behavior.physics,x,y,z,r:def.r,h:def.h,yaw:def.yaw??Math.random()*6.28,vy:0,on:0,st:'idle',t:1+Math.random()*2,ty:0,look:0,acc:0,k:0,wild:false,forageSearchT:1+Math.random()*4,socialSearchT:3+Math.random()*7,stuckT:0,recoveryCooldown:0,recoverActive:false,recoverMode:null,recoverPurpose:null,recoverThreatX:null,recoverThreatZ:null,recoverWait:0,escapeRequested:false,escapePath:null,beanLureTarget:null,beanLureSearchT:0,beanLureCooldown:0,navBlockedEdges:new Map(),navEdgeTestCache:new Map(),navVisited:new Map(),recoverClimbKey:null,recoverClimbAttempts:0};
+    if(def.behavior.flags.home){m.hx=x;m.hz=z}
     scene.add(m.root);this.list.push(m);return m;
   },
   remove(m){m.dead=1;scene.remove(m.root);m.root.traverse(o=>o.geometry&&o.geometry.dispose());const i=this.list.indexOf(m);if(i>=0)this.list.splice(i,1)},
+  pushFromPlayer(m,px,pz,dt){
+    let dx=m.x-px,dz=m.z-pz,d=Math.hypot(dx,dz);
+    if(d<1e-4){dx=-Math.sin(m.yaw);dz=-Math.cos(m.yaw);d=Math.hypot(dx,dz)||1}
+    let ux=dx/d,uz=dz/d;
+    // 旧版の押し出しで既に壁へ食い込んでいた個体も、近傍の安全な位置へ戻す。
+    if(boxHit(m,m.x,m.y,m.z)){
+      const base=Math.atan2(uz,ux);
+      for(let r=.08;r<=1.2;r+=.08){
+        let fixed=false;
+        for(let i=0;i<24;i++){
+          const k=i===0?0:(i%2?1:-1)*Math.ceil(i/2),a=base+k*Math.PI/12;
+          const nx=m.x+Math.cos(a)*r,nz=m.z+Math.sin(a)*r;
+          if(!boxHit(m,nx,m.y,nz)){m.x=nx;m.z=nz;fixed=true;break}
+        }
+        if(fixed)return;
+      }
+      return;
+    }
+    if(d>=m.def.behavior.physics.pushRadius)return;
+    const amount=Math.min(.18,Math.max(.018,(.62-d)*Math.min(1,dt*9)));
+    const mx=ux*amount,mz=uz*amount;
+    const moveX=()=>{const nx=m.x+mx;if(!boxHit(m,nx,m.y,m.z)){m.x=nx;return true}return false};
+    const moveZ=()=>{const nz=m.z+mz;if(!boxHit(m,m.x,m.y,nz)){m.z=nz;return true}return false};
+    // 軸ごとに衝突を確認し、壁に向かう成分だけを捨てて壁沿いに滑らせる。
+    if(Math.abs(mx)>=Math.abs(mz)){moveX();moveZ()}
+    else{moveZ();moveX()}
+  },
   clear(){for(const m of this.list.slice())this.remove(m);gq.length=0;gqs.clear();this.errands=[];this.park=[];this.seen=new Set()},
-  shift(dx,dz){if(Math.abs(dx)+Math.abs(dz)>4096){for(const m of this.list.slice()){if(m.def.persist)this.park.push(this.rec(m));this.remove(m)}return}   // 大ジャンプ: 桁落ちする前にチャンク相対で退避
-    for(const m of this.list)for(const [a,b] of [['x','z'],['hx','hz'],['tx','tz']])if(m[a]!==undefined){m[a]-=dx;m[b]-=dz}},
+  shift(dx,dz){if(Math.abs(dx)+Math.abs(dz)>4096){for(const m of this.list.slice()){if(m.def.behavior.flags.persist)this.park.push(this.rec(m));this.remove(m)}return}   // 大ジャンプ: 桁落ちする前にチャンク相対で退避
+    for(const m of this.list){for(const [a,b] of [['x','z'],['hx','hz'],['tx','tz']])if(m[a]!==undefined){m[a]-=dx;m[b]-=dz}if(m.beanTarget){m.beanTarget.x-=dx;m.beanTarget.z-=dz}}},
   rec(m){const fx=Math.floor(m.x/16),fz=Math.floor(m.z/16);return [m.type,m.vr,origin.x/16+fx,origin.z/16+fz,+(m.x-fx*16).toFixed(3),+m.y.toFixed(2),+(m.z-fz*16).toFixed(3)]},   // チャンク相対(原点に依存せず全域で同じ精度)
-  onChunk(c){   // チャンク受信時: そこに原点がある構造物の entities を、未出現なら1回だけ出す
+  onChunk(c){   // チャンク受信時: 構造物のMOBは、実際に立てる地面を探してから生成
     for(const s of c.structs||[]){
       if(Math.floor(s.x/16)!==c.cx||Math.floor(s.z/16)!==c.cz)continue;
       const E=STRUCT[s.n]&&STRUCT[s.n].entities,k=s.n+'@'+s.x+','+s.z;if(!E||this.seen.has(k))continue;
+      const pending=[];
+      for(const e of E){
+        const vs=MOBS[e.type].variants&&Object.keys(MOBS[e.type].variants);
+        const n=e.count[0]+(Math.random()*(e.count[1]-e.count[0]+1)|0);
+        for(let i=0;i<n;i++){
+          const x=(s.x-origin.x)+.5+(Math.random()-.5)*3,z=(s.z-origin.z)+.5+(Math.random()-.5)*3;
+          const spot=this.findSafeGroundSpot(e.type,x,z,s.y+4,1.5);
+          if(spot)pending.push({type:e.type,vr:vs?vs[Math.random()*vs.length|0]:null,spot});
+        }
+      }
+      if(!pending.length)continue; // 地面がまだ安全に確定できない場合、出現済み扱いにせず後日の再試行を許す
       this.seen.add(k);
-      for(const e of E){const vs=MOBS[e.type].variants&&Object.keys(MOBS[e.type].variants);
-        for(let i=0,n=e.count[0]+(Math.random()*(e.count[1]-e.count[0]+1)|0);i<n;i++)
-          this.add(e.type,vs?vs[Math.random()*vs.length|0]:null,(s.x-origin.x)+.5+(Math.random()-.5)*3,s.y+.05,(s.z-origin.z)+.5+(Math.random()-.5)*3)}
+      for(const e of pending)this.add(e.type,e.vr,e.spot.x,e.spot.y,e.spot.z);
     }
   },
-  spawnRec(r){return this.add(r[0],r[1],(r[2]*16-origin.x)+r[4],r[5],(r[3]*16-origin.z)+r[6])},
+  spawnRec(r){
+    const m=this.add(r[0],r[1],(r[2]*16-origin.x)+r[4],r[5],(r[3]*16-origin.z)+r[6]);
+    // 保存地点が地形編集で埋まっていた場合だけ、安全な地面へ移す。落下ブロックの再開位置は変えない。
+    if(!m.def.behavior.flags.keepSpot&&boxHit(m,m.x,m.y,m.z)){
+      const spot=this.findSafeGroundSpot(m.type,m.x,m.z,H-1,3);
+      if(spot){m.x=spot.x;m.y=spot.y;m.z=spot.z;m.vy=0;m.on=0}
+    }
+    return m;
+  },
   sync(){   // 保存対象MOBは範囲外で退避、範囲内に入ったら復帰
     const pcx=ctl.chunkX(),pcz=ctl.chunkZ(),R=Math.min(GFX.sim,CONFIG.streaming.renderDistance);
     for(const m of this.list.slice()){   // 範囲外: 保存対象は退避、常駐(非自然湧き)の非保存MOBは破棄
-      if(m.carried||m.cargo||m.st==='leave'||m.st==='bring')continue;
-      const r=this.rec(m);if(Math.hypot(r[2]-pcx,r[3]-pcz)<=R+3||(!m.def.persist&&m.wild))continue;
-      if(m.def.persist)this.park.push(r);this.remove(m)}
+      if(m.carried||m.cargo||isFlying(m))continue;
+      const r=this.rec(m);if(Math.hypot(r[2]-pcx,r[3]-pcz)<=R+3||(!m.def.behavior.flags.persist&&m.wild))continue;
+      if(m.def.behavior.flags.persist)this.park.push(r);this.remove(m)}
     for(let i=this.park.length-1;i>=0;i--){const r=this.park[i];if(Math.hypot(r[2]-pcx,r[3]-pcz)<=R){this.park.splice(i,1);this.spawnRec(r)}}
   },
-  save(){return [...this.list.filter(m=>m.def.persist).map(m=>this.rec(m)),...this.park]},
+  save(){return [...this.list.filter(m=>m.def.behavior.flags.persist).map(m=>this.rec(m)),...this.park]},
   load(p){this.park=(p.mobs||[]).slice();
     for(const v of p.vil||[]){const fx=Math.floor(v[0]/16),fz=Math.floor(v[2]/16);this.park.push(['villager',v[3],p.ox/16+fx,p.oz/16+fz,v[0]-fx*16,v[1],v[2]-fz*16])}   // 旧形式(原点相対)の変換
     this.seen=new Set(p.spawned||[]);this.errands=(p.err||[]).map(e=>({t:e[0],a:e[1],by:e[2]||'pigeon'}))},
   ground(x,z,top){const X=blk('x',x),Z=blk('z',z);if(!world.chunk(Math.floor(X/16),Math.floor(Z/16)))return -1;
     for(let y=Math.min(H-1,Math.floor(top));y>0;y--)if(SOLID[get(X,y,Z)])return y+1;return -1},
+  safeGroundSpot(type,x,z,top=H-1){
+    // 地面の種類だけでなく、MOBの幅・高さぶんの空間と水の有無まで検査する。
+    const def=MOBS[type];if(!def||!Number.isFinite(x)||!Number.isFinite(z))return null;
+    const X=blk('x',x),Z=blk('z',z),c=world.chunk(Math.floor(X/16),Math.floor(Z/16));
+    if(!c||!c.data)return null;
+    const hi=Math.min(H-2,Math.floor(Number.isFinite(top)?top:H-2));
+    const lx0=Math.floor(x-def.r+1e-6),lx1=Math.floor(x+def.r-1e-6);
+    const lz0=Math.floor(z-def.r+1e-6),lz1=Math.floor(z+def.r-1e-6);
+    for(let y=hi;y>0;y--){
+      const floor=get(X,y,Z);
+      if(!SOLID[floor]||FK[floor]||TRANS[floor]||isTreeBlock(floor))continue;
+      const feet=y+1, y0=Math.floor(feet+1e-5), y1=Math.ceil(feet+def.h-1e-5)-1;
+      let clear=true;
+      for(let by=y0;by<=y1&&clear;by++)for(let lz=lz0;lz<=lz1&&clear;lz++)for(let lx=lx0;lx<=lx1;lx++){
+        const id=get(origin.x+lx,by,origin.z+lz);
+        if(SOLID[id]||FK[id]){clear=false;break}
+      }
+      if(!clear)continue;
+      const probe={r:def.r,h:def.h};
+      if(boxHit(probe,x,feet+.001,z))continue;
+      return {x,z,y:feet+.001,floor};
+    }
+    return null;
+  },
+  findSafeGroundSpot(type,x,z,top=H-1,radius=0){
+    const direct=this.safeGroundSpot(type,x,z,top);if(direct)return direct;
+    if(radius<=0)return null;
+    // 目的点の周囲を近い順に調べ、ブロック境界ぎりぎりや小さな障害物を避ける。
+    const cx=Math.floor(x)+.5,cz=Math.floor(z)+.5,lim=Math.ceil(radius+0.5),cand=[];
+    for(let dz=-lim;dz<=lim;dz++)for(let dx=-lim;dx<=lim;dx++){
+      const px=cx+dx,pz=cz+dz,d=Math.hypot(px-x,pz-z);
+      if(d<=radius+.75)cand.push({x:px,z:pz,d});
+    }
+    cand.sort((a,b)=>a.d-b.d);
+    for(const p of cand){const spot=this.safeGroundSpot(type,p.x,p.z,top);if(spot)return spot}
+    return null;
+  },
   open(x,z,gy){for(let k=0;k<25;k++)if(solid(blk('x',x),gy+k,blk('z',z)))return false;return true},
-  spawnNatural(){   // MOBS[*].spawn の規則で自然湧き
-    for(const [type,d] of Object.entries(MOBS)){const s=d.spawn;if(!s)continue;
+  inWater(m){
+    const X=blk('x',m.x),Z=blk('z',m.z);
+    return !!FK[get(X,Math.floor(m.y+.05),Z)]||!!FK[get(X,Math.floor(m.y+.4),Z)];
+  },
+  dryLand(x,z,y){
+    const X=blk('x',x),Z=blk('z',z),floor=get(X,y-1,Z);
+    return y>0&&SOLID[floor]&&!FK[get(X,y,Z)]&&!FK[get(X,y+1,Z)]&&this.open(x,z,y);
+  },
+  findShore(m,radius=10){
+    let best=null,bestScore=Infinity;
+    const cx=Math.floor(m.x),cz=Math.floor(m.z);
+    for(let dz=-radius;dz<=radius;dz++)for(let dx=-radius;dx<=radius;dx++){
+      if(dx*dx+dz*dz>radius*radius)continue;
+      const x=cx+dx+.5,z=cz+dz+.5,d=Math.hypot(x-m.x,z-m.z);
+      if(d<.8)continue;
+      const y=this.ground(x,z,H-1);
+      if(y<1||!this.dryLand(x,z,y))continue;
+      const heading=faceTo(m,x,z),blockedPenalty=m.waterAvoidYaw!==undefined&&Math.abs(wrap(heading-m.waterAvoidYaw))<.8?5:0;
+      const floor=get(blk('x',x),y-1,blk('z',z));
+      const score=d+Math.max(0,y-m.y)*1.25+(floor===ID.grass?0:1.1)+blockedPenalty;
+      if(score<bestScore){bestScore=score;best={x,z,y}}
+    }
+    return best;
+  },
+  walkableAhead(m,yaw){
+    // ナビゲーションの足場判定に草ブロックを要求しない。
+    // 穴を掘ると床が土・石になるため、草を探す徘徊AIでは壁の上の草地を目指して詰まりやすい。
+    // 「生活目標として草地を好むこと」と「物理的に歩ける床」を分離する。
+    const x=m.x-Math.sin(yaw)*1.05,z=m.z-Math.cos(yaw)*1.05;
+    const X=blk('x',x),Z=blk('z',z),gy=this.ground(x,z,m.y+2.5);
+    if(gy<1)return false;
+    const floor=get(X,gy-1,Z);
+    if(!SOLID[floor]||FK[get(X,gy,Z)]||FK[get(X,gy+1,Z)])return false;
+    const rise=gy-m.y;
+    // その場から登れない壁・降りられない落差は、草地であっても候補にしない。
+    if(rise>1.08||rise< -2.2)return false;
+    return this.open(x,z,gy)&&!boxHit(m,x,gy+.03,z);
+  },
+  pathClear(m,tx,tz,targetY=m.y){
+    const d=Math.hypot(tx-m.x,tz-m.z),steps=Math.max(1,Math.ceil(d*2));let lastY=m.y;
+    for(let i=1;i<=steps;i++){
+      const f=i/steps,x=m.x+(tx-m.x)*f,z=m.z+(tz-m.z)*f;
+      const gy=this.ground(x,z,Math.max(lastY,targetY)+3),X=blk('x',x),Z=blk('z',z);
+      // 豆・村人への直線経路は乾いた草地だけ。水底を地面と誤認して水中を横断させない。
+      if(gy<1||gy-lastY>1.12||lastY-gy>2.5||get(X,gy-1,Z)!==ID.grass||FK[get(X,gy,Z)]||FK[get(X,gy+1,Z)]||boxHit(m,x,gy+.03,z))return false;
+      lastY=gy;
+    }
+    return true;
+  },
+  navCellKey(cx,cz,y){return `${cx},${cz},${Math.round(y)}`},
+  markNavVisited(m,cx,cz,y){
+    m.navVisited=m.navVisited||new Map();const key=this.navCellKey(cx,cz,y);
+    m.navVisited.delete(key);m.navVisited.set(key,this.T);
+    while(m.navVisited.size>256)m.navVisited.delete(m.navVisited.keys().next().value);
+  },
+  estimateRimHeight(m,radius=8){
+    // 「少し高い床がある」だけでは穴の出口とみなさない。
+    // MOBの周囲の外周を調べ、穴の縁に相当する高さを推定する。
+    const samples=[],top=Math.min(H-1,Math.floor(m.y+20));
+    // 穴の中にできた小さな段差を外周の高さと誤認しないよう、探索半径の外側だけを採取。
+    const rings=[Math.max(1.5,radius-.9),Math.max(1.5,radius-.25)];
+    for(let i=0;i<32;i++){
+      const a=i*Math.PI*2/32,cs=Math.cos(a),sn=Math.sin(a);
+      for(const r of rings){
+        const x=m.x+cs*r,z=m.z+sn*r,X=blk('x',x),Z=blk('z',z);
+        if(!world.chunk(Math.floor(X/16),Math.floor(Z/16)))continue;
+        const y=this.ground(x,z,top);
+        if(y<1||!this.dryLand(x,z,y))continue;
+        samples.push(y);
+      }
+    }
+    if(samples.length<10)return null;
+    samples.sort((a,b)=>a-b);
+    return samples[Math.floor((samples.length-1)*.72)];
+  },
+  navEdgeKey(from,to){return `${this.navCellKey(from.cx,from.cz,from.y)}>${this.navCellKey(to.cx,to.cz,to.y)}`},
+  navEdgeSignature(m,from,to){
+    // 失敗した辺の周辺ブロックを記録。壁が壊された/新設された場合は古い失敗記録を無効にする。
+    const sx=from.cx+.5,sz=from.cz+.5,tx=to.cx+.5,tz=to.cz+.5;
+    const steps=Math.max(3,Math.ceil(Math.hypot(tx-sx,tz-sz)*3));
+    const y0=Math.max(0,Math.floor(Math.min(from.y,to.y)-.1));
+    const y1=Math.min(H-1,Math.ceil(Math.max(from.y,to.y)+m.h+.2));
+    let hash=2166136261;
+    for(let i=0;i<=steps;i++){
+      const t=i/steps,x=sx+(tx-sx)*t,z=sz+(tz-sz)*t;
+      for(const ox of [-m.r,0,m.r])for(const oz of [-m.r,0,m.r]){
+        const X=blk('x',x+ox),Z=blk('z',z+oz);
+        for(let y=y0;y<=y1;y++)hash=Math.imul(hash^(get(X,y,Z)+y*257+i*17),16777619);
+      }
+    }
+    return hash>>>0;
+  },
+  standCell(m,cx,cz,refY){
+    const x=cx+.5,z=cz+.5,X=blk('x',x),Z=blk('z',z);
+    if(!world.chunk(Math.floor(X/16),Math.floor(Z/16)))return null;
+    const lo=Math.max(1,Math.floor(refY-2.2)),hi=Math.min(H-2,Math.floor(refY+3.05));
+    const base=clamp(Math.round(refY),lo,hi),ys=[];
+    // 最も近い床面から調べる。以前は常に高い面を先に選び、隣接マスの通常の床を見落とすことがあった。
+    for(let d=0;base-d>=lo||base+d<=hi;d++){
+      if(d===0){ys.push(base);continue}
+      if(base+d<=hi)ys.push(base+d);
+      if(base-d>=lo)ys.push(base-d);
+    }
+    for(const y of ys){
+      if(!SOLID[get(X,y-1,Z)])continue;
+      if(FK[get(X,y,Z)]||FK[get(X,y+1,Z)])continue;
+      if(boxHit(m,x,y+.03,z))continue;
+      return {cx,cz,x,z,y};
+    }
+    return null;
+  },
+  navJumpEdgeClear(m,from,to){
+    // 立方体の高さだけで「登れる」と判断せず、実際のMOB物理・速度・重力で
+    // 1ブロック段差へのジャンプを短時間シミュレーションして、着地可能な辺だけ採用する。
+    const key=this.navEdgeKey(from,to),sig=this.navEdgeSignature(m,from,to);
+    m.navEdgeTestCache=m.navEdgeTestCache||new Map();
+    const cached=m.navEdgeTestCache.get(key);
+    if(cached&&cached.until>this.T&&cached.signature===sig)return cached.ok;
+    const dx=to.x-from.x,dz=to.z-from.z,dist=Math.hypot(dx,dz);
+    if(!dist)return true;
+    const trial={x:from.x,y:from.y+.001,z:from.z,r:m.r,h:m.h,vy:m.phys.jump,on:0,phys:m.phys,
+      climbCooldown:m.phys.jumpCooldown,inWater:false,bump:0};
+    const speed=1.2,dt=1/60,ux=dx/dist,uz=dz/dist;
+    let ok=false;
+    // 物理シミュレーションは経路生成時のみ行う。通常のフレーム更新ではキャッシュ済みの
+    // 経路を軽い衝突確認だけで追跡するため、MOBごとの常時負荷にはならない。
+    for(let t=0;t<1.55;t+=dt){
+      phys(trial,dt,ux*speed,uz*speed);
+      const d=Math.hypot(to.x-trial.x,to.z-trial.z);
+      if(d<.30&&trial.y>=to.y-.12&&trial.y<=to.y+.62&&!boxHit(trial,trial.x,trial.y+.025,trial.z)){
+        ok=true;break;
+      }
+      if(trial.y>from.y+1.75||trial.y<from.y-2.25)break;
+    }
+    m.navEdgeTestCache.set(key,{until:this.T+2.5,signature:sig,ok});
+    while(m.navEdgeTestCache.size>384)m.navEdgeTestCache.delete(m.navEdgeTestCache.keys().next().value);
+    return ok;
+  },
+  navEdgeClear(m,from,to,simulateJump=false){
+    if(!from||!to)return false;
+    const rise=to.y-from.y;
+    if(rise>1.08||rise< -2.2)return false;
+    const key=this.navEdgeKey(from,to),blocked=m.navBlockedEdges&&m.navBlockedEdges.get(key);
+    // 目的地が現在も同じ高さで立てる場所かを確認する。地形が変わった古いウェイポイントは使わない。
+    const live=this.standCell(m,to.cx,to.cz,to.y);
+    if(!live||Math.abs(live.y-to.y)>.15)return false;
+    const sx=from.x,sz=from.z,tx=to.x,tz=to.z,dist=Math.hypot(tx-sx,tz-sz);
+    if(rise>.35){
+      for(let y=from.y+.15;y<to.y+.02;y+=.22)if(boxHit(m,sx,y,sz))return false;
+    }
+    const steps=Math.max(4,Math.ceil(dist*6));
+    for(let i=1;i<=steps;i++){
+      const t=i/steps,x=sx+(tx-sx)*t,z=sz+(tz-sz)*t;
+      const y=rise>.35?to.y+.03:from.y+(to.y-from.y)*t;
+      if(boxHit(m,x,y,z))return false;
+    }
+    if(blocked){
+      const until=typeof blocked==='number'?blocked:blocked.until;
+      if(until>this.T){
+        const sig=this.navEdgeSignature(m,from,to);
+        if(typeof blocked==='number'||sig===blocked.signature)return false;
+      }
+      m.navBlockedEdges.delete(key);
+    }
+    if(simulateJump&&rise>.35&&!this.navJumpEdgeClear(m,from,to))return false;
+    return true;
+  },
+  findEscapePath(m,radius=8,purpose='recover',threatX=null,threatZ=null){
+    const sx=Math.floor(m.x),sz=Math.floor(m.z),startY=Math.round(m.y);
+    const start={cx:sx,cz:sz,x:m.x,z:m.z,y:startY,parent:null,steps:0};
+    const queue=[start],seen=new Map([[this.navCellKey(sx,sz,startY),start]]),dirs=[[1,0],[-1,0],[0,1],[0,-1]];
+    m.navBlockedEdges=m.navBlockedEdges||new Map();m.navVisited=m.navVisited||new Map();
+    for(const [k,record] of m.navBlockedEdges){const until=typeof record==='number'?record:record.until;if(until<=this.T)m.navBlockedEdges.delete(k)}
+    // 到達可能な足場グラフを列挙。上り辺は実際のMOB物理でジャンプ試験してから追加する。
+    for(let qi=0;qi<queue.length;qi++){
+      const n=queue[qi];
+      for(const [dx,dz] of dirs){
+        const cx=n.cx+dx,cz=n.cz+dz;
+        if((cx-sx)*(cx-sx)+(cz-sz)*(cz-sz)>radius*radius)continue;
+        const cell=this.standCell(m,cx,cz,n.y);if(!cell)continue;
+        const rise=cell.y-n.y;if(rise>1.08||rise< -2.2)continue;
+        if(!this.navEdgeClear(m,n,cell,rise>.35))continue;
+        const key=this.navCellKey(cell.cx,cell.cz,cell.y);if(seen.has(key))continue;
+        const next={...cell,parent:n,steps:n.steps+1};seen.set(key,next);queue.push(next);
+      }
+    }
+    let goal=null,best=-Infinity,mode='inside';
+    // 恐怖時は「穴の外へ出る」ことを推測せず、まず現在の到達可能範囲内で
+    // プレイヤーから離れられる地点を選ぶ。外へ行けない穴でも、壁へ向かう直進をしない。
+    const fleeing=purpose==='flee';
+    if(!fleeing){
+      const rimY=this.estimateRimHeight(m,radius);
+      const trappedBelowRim=Number.isFinite(rimY)&&rimY-startY>=1.35;
+      if(trappedBelowRim){
+        for(const n of queue){
+          if(n===start)continue;
+          const rise=n.y-startY;
+          // 目的地は、物理シミュレーションで検証した辺だけからなる経路で到達できた足場に限定。
+          if(rise>=1.0&&n.y>=rimY-.65){
+            const k=this.navCellKey(n.cx,n.cz,n.y),age=this.T-(m.navVisited.get(k)??-1e6);
+            const novelty=age<12?1.5*(1-age/12):0;
+            const score=rise*2.2-n.steps*.38-Math.abs(rimY-n.y)*1.4+novelty;
+            if(score>best){best=score;goal=n}
+          }
+        }
+        if(goal)mode='escape';
+      }
+    }
+    if(!goal){
+      // 外へ出る経路がグラフに存在しなければ内部移動へ。恐怖時は脅威から距離を取る。
+      mode=fleeing?'flee':'inside';
+      const candidates=queue.filter(n=>n!==start&&n.steps>=(fleeing?1:2));
+      if(candidates.length){
+        let bestScore=-Infinity;
+        for(const n of candidates){
+          const k=this.navCellKey(n.cx,n.cz,n.y),age=this.T-(m.navVisited.get(k)??-1e6);
+          const revisit=age<18?(18-age)*(fleeing?1.1:.42):0;
+          const heading=faceTo(m,n.x,n.z),turnCost=Math.abs(wrap(heading-m.yaw))>2.2?.35:0;
+          let score;
+          if(fleeing){
+            const threatD=Number.isFinite(threatX)&&Number.isFinite(threatZ)?Math.hypot(n.x-threatX,n.z-threatZ):0;
+            score=threatD*2.8+n.steps*.08-Math.abs(n.y-startY)*.2-turnCost-revisit+Math.random()*.08;
+          }else score=n.steps-Math.abs(n.y-startY)*.35-turnCost-revisit+Math.random()*.12;
+          if(score>bestScore){bestScore=score;goal=n}
+        }
+      }
+    }
+    const path=[];
+    for(let n=goal;n&&n!==start;n=n.parent){
+      const p=n.parent;
+      path.unshift({x:n.x,z:n.z,y:n.y,cx:n.cx,cz:n.cz,
+        fromX:p.x,fromZ:p.z,fromY:p.y,fromCx:p.cx,fromCz:p.cz,
+        edgeKey:this.navEdgeKey(p,n)});
+    }
+    // 現在地も訪問履歴へ。経路探索は毎回最新の地形からやり直す。
+    this.markNavVisited(m,sx,sz,startY);
+    path.mode=mode;
+    return path;
+  },
+  findPlayerApproach(m,px,pz){
+    // プレイヤーの位置そのものではなく、周囲の草地に「寄っていく先」を置く。
+    // これならプレイヤーが土・石の上にいても、ハトが水や壁を突っ切ろうとしない。
+    let best=null,bestScore=Infinity;
+    const cx=Math.floor(px),cz=Math.floor(pz);
+    for(let dz=-3;dz<=3;dz++)for(let dx=-3;dx<=3;dx++){
+      const x=cx+dx+.5,z=cz+dz+.5,dp=Math.hypot(x-px,z-pz);
+      if(dp<.72||dp>2.8)continue;
+      const X=blk('x',x),Z=blk('z',z),gy=this.ground(x,z,ctl.position.y+4);
+      if(gy<1||get(X,gy-1,Z)!==ID.grass||FK[get(X,gy,Z)]||FK[get(X,gy+1,Z)]||!this.open(x,z,gy))continue;
+      if(!this.pathClear(m,x,z,gy))continue;
+      const dm=Math.hypot(x-m.x,z-m.z),score=dm+Math.abs(dp-1.25)*1.4;
+      if(score<bestScore){bestScore=score;best={x,z,y:gy}}
+    }
+    return best;
+  },
+  findBean(m,radius,id){
+    let best=null,bestD=radius;
+    const cx=Math.floor(m.x),cz=Math.floor(m.z);
+    for(let dz=-radius;dz<=radius;dz++)for(let dx=-radius;dx<=radius;dx++){
+      const lx=cx+dx+.5,lz=cz+dz+.5,d=Math.hypot(lx-m.x,lz-m.z);
+      if(d>bestD)continue;
+      const wx=blk('x',lx),wz=blk('z',lz),gy=this.ground(lx,lz,m.y+5);
+      if(gy<1||get(wx,gy,wz)!==id)continue;
+      if(!this.pathClear(m,lx,lz,gy))continue;
+      best={x:lx,z:lz,wx,y:gy,wz};bestD=d;
+    }
+    return best;
+  },
+  endChat(m){
+    const p=m.chatPartner;
+    const rest=x=>rr((x.def.behavior.params.social||GOAL_DEFAULTS.social).rest);
+    m.chatPartner=null;m.chatState=null;m.chatLeader=false;m.socialSearchT=rest(m);
+    if(p&&p.chatPartner===m){p.chatPartner=null;p.chatState=null;p.chatLeader=false;p.socialSearchT=rest(p)}
+    m.st='idle';if(p&&!isFlying(p))p.st='idle';
+  },
+  spawnNatural(){   // MOBS[*].spawn の規則で自然湧き。生成前に足場・頭上・水・MOB全体の衝突を確認
+    for(const [type,d] of Object.entries(MOBS)){const s=d.behavior.spawn;if(!s)continue;
       if(this.list.filter(m=>m.type===type&&m.wild).length>=s.cap)continue;
-      const a=Math.random()*6.28,r=s.ring[0]+Math.random()*(s.ring[1]-s.ring[0]),x=ctl.position.x+Math.cos(a)*r,z=ctl.position.z+Math.sin(a)*r,gy=this.ground(x,z,ctl.position.y+30);
-      if(gy<1||FK[get(blk('x',x),gy,blk('z',z))]||!s.on.some(n=>ID[n]===get(blk('x',x),gy-1,blk('z',z))))continue;
-      for(let i=0,n=s.group[0]+(Math.random()*(s.group[1]-s.group[0]+1)|0);i<n;i++){const bx=x+(Math.random()-.5)*4,bz=z+(Math.random()-.5)*4,by=this.ground(bx,bz,gy+3);if(by>0&&!FK[get(blk('x',bx),by,blk('z',bz))])this.add(type,null,bx,by+.05,bz).wild=true}
+      const a=Math.random()*6.28,r=s.ring[0]+Math.random()*(s.ring[1]-s.ring[0]),x=ctl.position.x+Math.cos(a)*r,z=ctl.position.z+Math.sin(a)*r;
+      const center=this.findSafeGroundSpot(type,x,z,ctl.position.y+30,1);
+      if(!center||!s.on.some(n=>ID[n]===center.floor))continue;
+      const n=s.group[0]+(Math.random()*(s.group[1]-s.group[0]+1)|0);
+      for(let added=0;added<n;){
+        let spot=null;
+        for(let attempt=0;attempt<8&&!spot;attempt++){
+          const bx=x+(Math.random()-.5)*4,bz=z+(Math.random()-.5)*4;
+          const candidate=this.findSafeGroundSpot(type,bx,bz,center.y+4,1);
+          if(!candidate||!s.on.some(name=>ID[name]===candidate.floor))continue;
+          if(this.list.some(m=>!m.carried&&m.type===type&&Math.hypot(m.x-candidate.x,m.z-candidate.z)<(m.r+MOBS[type].r)*1.5))continue;
+          spot=candidate;
+        }
+        if(spot){this.add(type,null,spot.x,spot.y,spot.z).wild=true;added++}else break;
+      }
     }
   },
-  arrive(e){   // お使い完了: MOBS[e.by].errand の定義どおりに、運び手が積み荷を吊るして戻ってくる
-    const E=MOBS[e.by].errand,C=E.cargo,px=ctl.position.x,pz=ctl.position.z;let L=null;
-    for(let i=0;i<14&&!L;i++){const a=Math.random()*6.28,d=3+Math.random()*5,x=px+Math.cos(a)*d,z=pz+Math.sin(a)*d,gy=this.ground(x,z,ctl.position.y+12);
-      if(gy>0&&this.open(x,z,gy))L={x,z,gy}}
-    L=L||{x:px+2,z:pz,gy:Math.floor(ctl.position.y-ctl.eyeHeight)};
-    const p=this.add(e.by,null,px+Math.cos(e.a)*E.dist,L.gy+14,pz+Math.sin(e.a)*E.dist),v=this.add(C.type,C.variants[Math.random()*C.variants.length|0],p.x,p.y-E.hang,p.z);
-    Object.assign(p,{st:'bring',tx:L.x,tz:L.z,gy:L.gy,cargo:v});v.carried=p;v.hx=L.x;v.hz=L.z;toast(E.toast);
+  arrive(e){   // お使い完了: 着地点の地面と村人の全身スペースを確保してから帰還を開始
+    const E=MOBS[e.by].behavior.errand,C=E.cargo,px=ctl.position.x,pz=ctl.position.z;let L=null;
+    const top=Math.min(H-2,Math.floor(ctl.position.y+12));
+    for(let i=0;i<36&&!L;i++){
+      const a=Math.random()*6.28,d=3+Math.random()*5,x=px+Math.cos(a)*d,z=pz+Math.sin(a)*d;
+      const spot=this.findSafeGroundSpot(C.type,x,z,top,1.5);
+      if(!spot||Math.hypot(spot.x-px,spot.z-pz)<2.5)continue;
+      if(this.list.some(m=>!m.carried&&m.type===C.type&&Math.hypot(m.x-spot.x,m.z-spot.z)<(m.r+MOBS[C.type].r)*1.8))continue;
+      L={x:spot.x,z:spot.z,gy:spot.y};
+    }
+    if(!L){this.errands.push({t:rr(E.retry),a:e.a,by:e.by});return} // 地面が読み込まれていない/安全な足場がない場合は、おつかいを失敗させず再試行
+    const p=this.add(e.by,null,px+Math.cos(e.a)*E.dist,L.gy+E.altitude,pz+Math.sin(e.a)*E.dist),v=this.add(C.type,C.variants[Math.random()*C.variants.length|0],p.x,p.y-E.hang,p.z);
+    Object.assign(p,{st:E.state,tx:L.x,tz:L.z,gy:L.gy,cargo:v});v.carried=p;v.hx=L.x;v.hz=L.z;toast(E.toast);
   },
-  walk(m,dt,sp){phys(m,dt,-Math.sin(m.yaw)*sp,-Math.cos(m.yaw)*sp);if(m.bump){m.bump=0;m.ty=Math.random()*6.28}
-    m.air=m.on?0:(m.air||0)+dt;m.ps=m.def.air&&m.air>.15?'fly':sp?'walk':m.def.idle||'idle'},
-  wander(m,dt,s){
-    if(m.st==='walk'){if((m.t-=dt)<=0){m.st='idle';m.t=1+Math.random()*3}turn(m,m.ty,dt,4);return s}
-    if((m.t-=dt)<=0){m.st='walk';m.t=1+Math.random()*2;m.ty=m.hx!==undefined&&Math.hypot(m.x-m.hx,m.z-m.hz)>10?faceTo(m,m.hx,m.hz):Math.random()*6.28}
+  walk(m,dt,sp){
+    const B=m.def.behavior,K=B.stuck,ox=m.x,oz=m.z;phys(m,dt,-Math.sin(m.yaw)*sp,-Math.cos(m.yaw)*sp);
+    const moved=Math.hypot(m.x-ox,m.z-oz),expected=Math.abs(sp)*dt;
+    m.recoveryCooldown=Math.max(0,(m.recoveryCooldown||0)-dt);
+    if(m.inWater)m.stuckT=0;
+    else if(sp>K.minSpeed&&moved<Math.max(K.minMove,expected*K.ratio)){
+      m.stuckT=(m.stuckT||0)+dt;
+      if(m.stuckT>K.time&&m.on&&m.recoveryCooldown<=0&&!inSt(m,'noRescue'))m.escapeRequested=true;
+    }else m.stuckT=Math.max(0,(m.stuckT||0)-dt*2);
+    if(m.bump){m.bump=0;if(m.vy<=0){if(m.st===B.scare.state)m.scareDir=wrap(m.yaw+(Math.random()<.5?-1:1)*K.bumpTurn);else if(m.st!=='recover'&&(m.stuckT||0)<.45)m.ty=Math.random()*6.28}}
+    m.air=m.on?0:(m.air||0)+dt;m.ps=B.flags.air&&m.air>B.anim.airDelay?B.anim.air:sp?'walk':B.anim.idle},
+  wander(m,dt,o){
+    const s=o.speed;
+    // 水際や穴の中で進行方向に歩ける足場がないとき、単に停止して待つのではなく
+    // 周囲の到達可能な足場を探してから向きを変える。停止中の向き変更は移動前に完了させる。
+    if(m.st==='turn'){
+      turn(m,m.ty,dt,o.faceTurn);
+      if(Math.abs(wrap(m.ty-m.yaw))<.12){m.st='walk';m.t=rr(o.walk)}
+      return 0;
+    }
+    if(m.st==='walk'){
+      turn(m,m.ty,dt,o.walkTurn);
+      if(m.on&&Math.abs(wrap(m.ty-m.yaw))<.22&&!this.walkableAhead(m,m.ty)){
+        const base=m.yaw,candidates=[];
+        for(let i=1;i<=32;i++){
+          const offset=(i%2?1:-1)*Math.ceil(i/2)*(Math.PI/16);
+          const a=wrap(base+offset);
+          if(this.walkableAhead(m,a))candidates.push({a,turn:Math.abs(wrap(a-base))});
+        }
+        if(candidates.length){
+          candidates.sort((a,b)=>a.turn-b.turn);
+          m.ty=candidates[0].a;m.st='turn';m.t=0;return 0;
+        }
+        m.escapeRequested=true;m.st='idle';m.t=.25;return 0;
+      }
+      if((m.t-=dt)<=0){m.st='idle';m.t=rr(o.idle)}
+      return s;
+    }
+    if((m.t-=dt)<=0){
+      const preferred=m.hx!==undefined&&Math.hypot(m.x-m.hx,m.z-m.hz)>o.homeRadius?faceTo(m,m.hx,m.hz):Math.random()*Math.PI*2;
+      let heading=preferred,bestTurn=Infinity;
+      // ランダムな進行方向が水・崖・障害物を向いていたら、近い歩行可能な方向へ振り替える。
+      for(let i=0;i<32;i++){
+        const offset=i===0?0:(i%2?1:-1)*Math.ceil(i/2)*(Math.PI/16);
+        const a=wrap(preferred+offset);
+        if(this.walkableAhead(m,a)){const d=Math.abs(wrap(a-preferred));if(d<bestTurn){bestTurn=d;heading=a}}
+      }
+      if(bestTurn===Infinity){m.escapeRequested=true;m.st='idle';m.t=.25;return 0}
+      m.ty=heading;m.st='turn';m.t=0;
+    }
     return 0;
   },
   update(dt){
@@ -2695,22 +3946,22 @@ const mobs={list:[],errands:[],park:[],seen:new Set(),T:0,spawnT:3,syncT:1,
     for(const m of this.list.slice())this.tick(m,dt,px,pz);
   },
   tick(m,dt,px,pz){
-    const fly=m.st==='leave'||m.st==='bring',car=m.carried;
+    const B=m.def.behavior,fly=isFlying(m),car=m.carried;
     if(!fly&&!car&&!world.chunk(Math.floor(blk('x',m.x)/16),Math.floor(blk('z',m.z)/16))){m.root.visible=false;return}   // 未読み込みチャンクでは凍結
-    const dp=Math.hypot(m.x-px,m.z-pz),sp=m.def.spawn;m.root.visible=fly||car||dp<=GFX.mobd;   // MOB描画距離の外は描かない
-    m.acc+=dt;if(dp>32&&!fly&&!car&&!m.def.always&&(++m.k&3))return;dt=m.acc;m.acc=0;   // 遠いMOBは1/4の頻度で更新
+    const dp=Math.hypot(m.x-px,m.z-pz),sp=B.spawn;m.root.visible=fly||car||dp<=GFX.mobd;   // MOB描画距離の外は描かない
+    m.acc+=dt;if(dp>B.lod.dist&&!fly&&!car&&!B.flags.always&&(++m.k%B.lod.every))return;dt=m.acc;m.acc=0;   // 遠いMOBは1/4の頻度で更新
     if(m.y<-10||(m.wild&&sp&&dp>sp.despawn)){this.remove(m);return}
     m.ps='idle';
-    for(const [g,o] of m.def.goals)if(GOALS[g](m,dt,o||{},px,pz,dp))break;
+    for(const [g,o] of B.goals)if(GOALS[g](m,dt,o,px,pz,dp))break;
     if(m.dead)return;
-    if(!fly&&!car&&!m.def.noPush&&dp<.6){m.x+=(m.x-px)*dt*4;m.z+=(m.z-pz)*dt*4}   // プレイヤーに重ならない
+    if(!fly&&!car&&!B.flags.noPush&&dp<B.physics.pushRadius)this.pushFromPlayer(m,px,pz,dt);   // プレイヤーに押されても壁の中へ移動しない
     m.root.position.set(m.x,m.y,m.z);m.root.rotation.y=m.yaw;
-    pose(m,m.ps,this.T);if(m.def.headTurn&&m.g.head)m.g.head.rotation.y=m.look;
+    pose(m,m.ps,this.T);if(B.flags.headTurn&&m.g.head)m.g.head.rotation.y=m.look;
   },
   aim(c){   // 視線と各MOBの当たり判定箱の交差(スラブ法)
     const o=c.position,d=c.look();let best=null;
     for(const m of this.list){
-      if(m.carried||m.def.noAim||!m.root.visible)continue;
+      if(m.carried||m.def.behavior.flags.noAim||!m.root.visible)continue;
       let t0=0,t1=c.reach;
       for(const [a,lo,hi] of [['x',m.x-m.r,m.x+m.r],['y',m.y,m.y+m.h],['z',m.z-m.r,m.z+m.r]]){
         if(Math.abs(d[a])<1e-6){if(o[a]<lo||o[a]>hi)t1=-1;continue}
@@ -2722,9 +3973,22 @@ const mobs={list:[],errands:[],park:[],seen:new Set(),T:0,spawnT:3,syncT:1,
     return best;
   },
   interact(m,b,c){   // MOBS[*].interact のデータを解釈するだけ
-    const i=m.def.interact&&m.def.interact[b];if(!i)return;
+    const i=m.def.behavior.interact[b];if(!i)return;
     if(i.holding&&c.block!==ID[i.holding])return;
-    if((i.wild&&!m.wild)||(i.states&&!i.states.includes(m.st)))return;
+    if((i.wild&&!m.wild)||(i.states&&!i.states.includes(m.st))||(i.unless&&i.unless.includes(m.st)))return;
+    if(i.scare){
+      const S=m.def.behavior.scare;
+      if(m.carried||m.recoverPurpose==='flee')return;
+      if(m.chatState)this.endChat(m);
+      m.beanTarget=null;m.beanLureTarget=null;m.beanLureCooldown=rr(S.lureCooldown);m.st=S.state;m.scareT=rr(S.dash);
+      m.scareDir=wrap(faceTo(m,c.position.x,c.position.z)+Math.PI);
+      // 以前の左クリック反応にあったジャンプを復活させ、逃走ダッシュの前段にする。
+      m.yaw=m.scareDir;m.scarePhase='hop';m.scarePhaseT=0;m.scareT=0;
+      m.vy=Math.max(m.vy,S.hopVy);m.on=0;
+      m.recoverPurpose=null;m.recoverActive=false;m.escapeRequested=false;m.escapePath=null;m.recoverMode=null;
+      m.forageSearchT=rr(S.forageDelay);
+      return;
+    }
     if(i.consume){c.hotbar[c.slot]=0;c.inventory.render()}
     if(i.set)Object.assign(m,i.set);if(i.hop){m.vy=i.hop;m.on=0}
     if(i.say){const L=m.def.variants[m.vr].lines;toast(L[Math.random()*L.length|0])}else if(i.toast)toast(i.toast);
@@ -2806,8 +4070,9 @@ function readPlayer(p){
   const n=v=>Number.isFinite(v)&&Math.abs(v)<1e15?v:null,x=n(p.x),y=n(p.y),z=n(p.z);
   if(x===null||y===null||z===null)return null;
   const hot=Array.isArray(p.hotbar)?p.hotbar.slice(0,CONFIG.hotbarSize).map(s=>typeof s==='string'?(s==='bean'?1000:isBlock(s)?BLOCKS[s].id:registerUnknown(s)):0):null;
+  if(hot&&!hot.includes(ID.torch)){const empty=hot.findIndex(v=>!v);if(empty>=0)hot[empty]=ID.torch;else if(hot.length<CONFIG.hotbarSize)hot.push(ID.torch)}
   const lim=v=>Number.isSafeInteger(v)?Math.max(-COORD_LIMIT,Math.min(COORD_LIMIT,Math.floor(v/16)*16)):0;
-  return {ox:lim(p.ox),oz:lim(p.oz),x,y,z,yaw:n(p.yaw)??0,pitch:Math.max(-1.5,Math.min(1.5,n(p.pitch)??0)),hotbar:hot,spawned:Array.isArray(p.spawned)?p.spawned.slice(0,5000).filter(k=>typeof k==='string'&&k.length<64):[],mobs:Array.isArray(p.mobs)?p.mobs.slice(0,500).filter(r=>Array.isArray(r)&&MOBS.hasOwnProperty(r[0])&&(!MOBS[r[0]].variants||MOBS[r[0]].variants[r[1]])&&Number.isSafeInteger(r[2])&&Number.isSafeInteger(r[3])&&[r[4],r[5],r[6]].every(Number.isFinite)):[],vil:Array.isArray(p.vil)?p.vil.slice(0,500).filter(v=>Array.isArray(v)&&v.slice(0,3).every(Number.isFinite)&&!!MOBS.villager.variants[v[3]]):[],err:Array.isArray(p.err)?p.err.slice(0,50).filter(e=>Array.isArray(e)&&Number.isFinite(e[0])&&Number.isFinite(e[1])&&(e[2]===undefined||(MOBS.hasOwnProperty(e[2])&&!!MOBS[e[2]].errand))):[],
+  return {ox:lim(p.ox),oz:lim(p.oz),x,y,z,yaw:n(p.yaw)??0,pitch:Math.max(-1.5,Math.min(1.5,n(p.pitch)??0)),hotbar:hot,spawned:Array.isArray(p.spawned)?p.spawned.slice(0,5000).filter(k=>typeof k==='string'&&k.length<64):[],mobs:Array.isArray(p.mobs)?p.mobs.slice(0,500).filter(r=>Array.isArray(r)&&MOBS.hasOwnProperty(r[0])&&(!MOBS[r[0]].variants||MOBS[r[0]].variants[r[1]])&&Number.isSafeInteger(r[2])&&Number.isSafeInteger(r[3])&&[r[4],r[5],r[6]].every(Number.isFinite)):[],vil:Array.isArray(p.vil)?p.vil.slice(0,500).filter(v=>Array.isArray(v)&&v.slice(0,3).every(Number.isFinite)&&!!MOBS.villager.variants[v[3]]):[],err:Array.isArray(p.err)?p.err.slice(0,50).filter(e=>Array.isArray(e)&&Number.isFinite(e[0])&&Number.isFinite(e[1])&&(e[2]===undefined||(MOBS.hasOwnProperty(e[2])&&!!MOBS[e[2]].behavior.errand))):[],
     slot:Number.isInteger(p.slot)&&p.slot>=0&&p.slot<CONFIG.hotbarSize?p.slot:CONFIG.startSlot};
 }
 
@@ -3040,6 +4305,8 @@ const GFX_ITEMS=[   // [種類, キー, 表示名, ...]
   ['sel','part','パーティクル',[[2,'すべて'],[1,'減らす'],[0,'なし']]],
   ['range','mobd','MOB描画距離',16,64,4,v=>v+' ブロック'],
   ['bool','water','水の半透明'],
+  ['bool','smooth','スムースライティング(影の境目と角をなめらかに)'],
+  ['sel','ao','└ 角の暗さ(スムース時)',[[1,'弱'],[2,'標準'],[3,'強']]],
   ['bool','aa','アンチエイリアス(再読み込み後)'],
   ['sel','dbg','デバッグ表示',[[0,'なし'],[1,'FPSのみ'],[2,'詳細']]]];
 class PauseMenu{
@@ -3192,7 +4459,7 @@ function dbgTick(raw,cpu,now){
   if(now-dT<500)return;
   const fps=dN*1000/dRaw,cpuAvg=dCpu/dN,cpuMax=dMax;dN=dRaw=dCpu=dMax=0;dT=now;
   if(!GFX.dbg){dbgEl.style.display='none';return}
-  let t=`Version 0.1.1\nFPS ${fps.toFixed(0)}  (CPU ${cpuAvg.toFixed(1)}ms / 最大 ${cpuMax.toFixed(1)}ms / GPU ${gpuExt?gpuMs.toFixed(1):'-'}ms)`;
+  let t=`Version 0.1.2\nFPS ${fps.toFixed(0)}  (CPU ${cpuAvg.toFixed(1)}ms / 最大 ${cpuMax.toFixed(1)}ms / GPU ${gpuExt?gpuMs.toFixed(1):'-'}ms)`;
   if(GFX.dbg>1){
     const i=renderer.info,heap=performance.memory?` / JS ${(performance.memory.usedJSHeapSize/1048576)|0}MB`:'';
     let ungen=0;
@@ -3237,7 +4504,14 @@ function frame(now){
   const h=ctl.locked?ctl.target():null,e=ctl.locked?mobs.aim(ctl):null,em=e&&(!h||e.d<ctl.bd(h));
   hl.visible=!!h||!!em;hl.scale.set(1,1,1);
   if(em){const m=e.m;hl.scale.set(m.r*2,m.h,m.r*2);hl.position.set(m.x,m.y+m.h/2,m.z)}
-  else if(h)hl.position.set(h.x+.5-origin.x,h.y+.5,h.z+.5-origin.z);
+  else if(h){
+    const id=get(h.x,h.y,h.z),k=id*6;
+    if(BOXP[id]){   // 専用判定のブロックは、その箱に合わせた選択枠
+      const w=BOX[k+3]-BOX[k],hh=BOX[k+4]-BOX[k+1],dd=BOX[k+5]-BOX[k+2];
+      hl.scale.set((w+.004)/1.004,(hh+.004)/1.004,(dd+.004)/1.004);
+      hl.position.set(h.x-origin.x+(BOX[k]+BOX[k+3])/2,h.y+(BOX[k+1]+BOX[k+4])/2,h.z-origin.z+(BOX[k+2]+BOX[k+5])/2);
+    }else hl.position.set(h.x+.5-origin.x,h.y+.5,h.z+.5-origin.z);
+  }
 
   gpuPoll();
   gpuBegin();
